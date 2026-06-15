@@ -1,41 +1,31 @@
 #!/usr/bin/env bash
 #
-# warp-rules.sh — обёртка над ipregion.sh
+# warp-rules.sh — анализатор гео сервера и WARP-выхода для Xray
 #
-# Что делает:
-#   1. Запускает ipregion.sh с выводом в JSON (-j).
-#   2. Определяет "страну сервера" (по GeoIP-сервисам, primary-группа).
-#   3. Проходит по сервисам и решает, какие "сломаны":
-#        - определяются как RU (а сервер не RU), ИЛИ
-#        - имеют явный флаг недоступности (Gemini Supported: No).
-#   4. Для каждого сломанного сервиса берёт его домены из таблицы соответствия
-#      и печатает готовый JSON-блок "rules" для заворачивания в WARP.
-#
-# YouTube НЕ трогаем никогда — он пропускается всегда (как ты просил).
+# Логика (компромисс):
+#   1. ipregion.sh -j -> страна сервера по КОНСЕНСУСУ (большинство голосов GeoIP).
+#   2. Ищет "сломанные" сервисы (определяются как RU, либо флаг No, напр. Gemini No).
+#      YouTube и YouTube Premium — пропускаются ВСЕГДА (для них RU это плюс).
+#   3. Проверяет WARP-выход (cdn-cgi/trace через WG-интерфейс).
+#   4. Вердикт:
+#        - сервер не-RU, сломанное чинится через WARP   -> выдаём блок;
+#        - сервер RU, но WARP даёт не-RU                -> всё равно чиним, выдаём блок;
+#        - сервер RU и WARP тоже RU/отсутствует         -> "работа невозможна".
+#   5. Печатает готовый JSON-блок доменов для WARP.
 #
 # Использование:
-#   bash warp-rules.sh                 # обычный запуск (локальный IP сервера)
-#   bash warp-rules.sh -- -p 127.0.0.1:1080   # всё после -- уходит в ipregion (напр. прокси)
-#
-# Требует: jq, curl (их ipregion и так ставит).
+#   bash warp-rules.sh
+#   bash warp-rules.sh -- -p 127.0.0.1:1080   # всё после -- уходит в ipregion
 
-set -euo pipefail
+set -uo pipefail
 
-# ---- настройки -------------------------------------------------------------
-
-WARP_TAG="warp-out"          # тег outbound, в который заворачиваем сломанное
-IPREGION_URL="https://raw.githubusercontent.com/vernette/ipregion/master/ipregion.sh"
-IPREGION_LOCAL="./ipregion.sh"   # если лежит рядом — используем его, иначе качаем
-
-# Какой GeoIP-сервис из primary считать "истиной" о стране сервера.
-# Берём первый из этого списка, у которого есть валидный ответ.
-SERVER_COUNTRY_SOURCES=("maxmind.com" "ipinfo.io" "cloudflare.com" "ipapi.co")
-
-# Сервисы, которые НИКОГДА не трогаем (пропускаем в любом случае).
+# =========================== НАСТРОЙКИ =====================================
+WARP_TAG="warp-out"
+IPREGION_URL="https://ipregion.vrnt.xyz"
+IPREGION_LOCAL="./ipregion.sh"
+BAD_COUNTRIES=("RU" "CN" "IR" "KP" "SY" "CU")
 SKIP_SERVICES=("YouTube" "YouTube Premium" "YouTube CDN")
 
-# Таблица соответствия: имя сервиса в ipregion -> домены/geosite для Xray.
-# Домены через запятую. Добавляй/правь под себя.
 declare -A SERVICE_DOMAINS=(
   ["Google"]="geosite:google-gemini,domain:gemini.google.com,domain:ai.google.dev,domain:aistudio.google.com,domain:makersuite.google.com,domain:generativelanguage.googleapis.com,domain:labs.google,domain:aisandbox-pa.googleapis.com"
   ["Gemini Supported"]="geosite:google-gemini,domain:gemini.google.com,domain:ai.google.dev,domain:aistudio.google.com,domain:makersuite.google.com,domain:generativelanguage.googleapis.com,domain:labs.google,domain:aisandbox-pa.googleapis.com"
@@ -53,16 +43,20 @@ declare -A SERVICE_DOMAINS=(
   ["JetBrains"]="domain:jetbrains.com"
 )
 
-# ---- получение JSON от ipregion --------------------------------------------
+# =========================== УТИЛИТЫ =======================================
+c_red(){ printf '\033[1;31m%s\033[0m' "$1"; }
+c_grn(){ printf '\033[1;32m%s\033[0m' "$1"; }
+c_yel(){ printf '\033[1;33m%s\033[0m' "$1"; }
+c_cyn(){ printf '\033[1;36m%s\033[0m' "$1"; }
+msg(){ printf '%s\n' "$*" >&2; }
+need(){ command -v "$1" >/dev/null 2>&1; }
+in_list(){ local x="$1"; shift; local i; for i in "$@"; do [[ "$i" == "$x" ]] && return 0; done; return 1; }
 
+# =========================== АРГУМЕНТЫ =====================================
 ipregion_args=()
-# всё, что после "--", передаём в ipregion как есть
-if [[ "${1:-}" == "--" ]]; then
-  shift
-  ipregion_args=("$@")
-fi
+if [[ "${1:-}" == "--" ]]; then shift; ipregion_args=("$@"); fi
 
-run_ipregion() {
+run_ipregion(){
   if [[ -f "$IPREGION_LOCAL" ]]; then
     bash "$IPREGION_LOCAL" -j "${ipregion_args[@]}"
   else
@@ -70,111 +64,132 @@ run_ipregion() {
   fi
 }
 
-echo "[*] Запускаю ipregion (это займёт ~10-30 сек)..." >&2
+if ! need curl; then msg "$(c_red '[!] curl не установлен')"; exit 1; fi
+
+# =========================== ШАГ 1: СЕРВЕР =================================
+msg "$(c_cyn '[*] Проверяю сервер через ipregion (~10-30 сек)...')"
 JSON="$(run_ipregion)"
 
-if ! echo "$JSON" | jq -e . >/dev/null 2>&1; then
-  echo "[!] ipregion вернул не-JSON. Прерываю." >&2
-  echo "$JSON" >&2
-  exit 1
+if ! need jq; then msg "$(c_red '[!] jq не найден. Установи: apt install -y jq')"; exit 1; fi
+if ! jq -e . >/dev/null 2>&1 <<<"$JSON"; then
+  msg "$(c_red '[!] ipregion вернул не-JSON:')"; msg "$JSON"; exit 1
 fi
 
-# ---- определяем страну сервера ---------------------------------------------
-
-SERVER_COUNTRY=""
-for src in "${SERVER_COUNTRY_SOURCES[@]}"; do
-  val="$(echo "$JSON" | jq -r --arg s "$src" '
-    (.results.primary // [])[] | select(.service==$s) | .ipv4 // empty')"
-  if [[ -n "$val" && "$val" != "null" && "$val" != "N/A" ]]; then
-    SERVER_COUNTRY="$val"
-    break
-  fi
-done
+SERVER_COUNTRY="$(jq -r '(.results.primary // [])[] | .ipv4 // empty' <<<"$JSON" \
+  | grep -oE '[A-Z]{2}' | sort | uniq -c | sort -rn | head -1 | awk '{print $2}')"
+VOTES="$(jq -r '(.results.primary // [])[] | .ipv4 // empty' <<<"$JSON" \
+  | grep -oE '[A-Z]{2}' | sort | uniq -c | sort -rn | awk '{printf "%s×%s ", $2, $1}')"
 
 if [[ -z "$SERVER_COUNTRY" ]]; then
-  echo "[!] Не смог определить страну сервера из primary-группы." >&2
-  exit 1
+  msg "$(c_red '[!] Не смог определить страну сервера.')"; exit 1
 fi
 
-echo "[*] Страна сервера определена как: $SERVER_COUNTRY" >&2
+msg ""
+msg "$(c_cyn '[*] Страна сервера (консенсус):') $(c_grn "$SERVER_COUNTRY")  $(c_yel "[голоса: $VOTES]")"
+SERVER_IS_RU=false
+[[ "$SERVER_COUNTRY" == "RU" ]] && SERVER_IS_RU=true
+if $SERVER_IS_RU; then
+  msg "$(c_yel '    Сервер сам определяется как RU — проверю, спасает ли WARP.')"
+fi
 
-# ---- решаем, что сломано ----------------------------------------------------
-
-# Собираем все custom-сервисы как "service<TAB>ipv4"
-mapfile -t ROWS < <(echo "$JSON" | jq -r '
-  (.results.custom // [])[] | "\(.service)\t\(.ipv4 // "")"')
-
-is_skipped() {
-  local name="$1"
-  for s in "${SKIP_SERVICES[@]}"; do
-    [[ "$s" == "$name" ]] && return 0
-  done
-  return 1
-}
-
-# Уникальный набор доменов сломанных сервисов
+# =========================== ШАГ 2: ЧТО СЛОМАНО ===========================
+mapfile -t ROWS < <(jq -r '(.results.custom // [])[] | "\(.service)\t\(.ipv4 // "")"' <<<"$JSON")
 declare -A BROKEN_DOMAINS=()
 BROKEN_REPORT=()
 
 for row in "${ROWS[@]}"; do
-  name="${row%%$'\t'*}"
-  value="${row#*$'\t'}"
-
-  # пропускаем YouTube и всё из SKIP
-  if is_skipped "$name"; then
-    continue
-  fi
-
-  # есть ли у нас домены для этого сервиса? если нет — пропускаем
-  domains="${SERVICE_DOMAINS[$name]:-}"
-  [[ -z "$domains" ]] && continue
-
-  broken=false
-  reason=""
-
-  # Критерий 1: явный флаг недоступности (Gemini Supported: No и т.п.)
-  if [[ "$value" == "No" ]]; then
-    broken=true
-    reason="недоступен (No)"
-  # Критерий 2: определяется как RU, а сервер не RU
-  elif [[ "$value" == "RU" && "$SERVER_COUNTRY" != "RU" ]]; then
-    broken=true
-    reason="определяется как RU"
-  fi
-
+  name="${row%%$'\t'*}"; value="${row#*$'\t'}"
+  in_list "$name" "${SKIP_SERVICES[@]}" && continue
+  domains="${SERVICE_DOMAINS[$name]:-}"; [[ -z "$domains" ]] && continue
+  broken=false; reason=""
+  if [[ "$value" == "No" ]]; then broken=true; reason="недоступен (No)"
+  elif [[ "$value" == "RU" ]]; then broken=true; reason="определяется как RU"; fi
   if $broken; then
     BROKEN_REPORT+=("$name — $reason")
     IFS=',' read -ra doms <<<"$domains"
-    for d in "${doms[@]}"; do
-      [[ -n "$d" ]] && BROKEN_DOMAINS["$d"]=1
-    done
+    for d in "${doms[@]}"; do [[ -n "$d" ]] && BROKEN_DOMAINS["$d"]=1; done
   fi
 done
 
-# ---- вывод -----------------------------------------------------------------
-
-if [[ ${#BROKEN_DOMAINS[@]} -eq 0 ]]; then
-  echo "" >&2
-  echo "[OK] Сломанных сервисов не найдено — ничего заворачивать в WARP не нужно." >&2
-  exit 0
+# Если сервер не-RU и ничего не сломано — WARP не нужен
+if ! $SERVER_IS_RU && [[ ${#BROKEN_DOMAINS[@]} -eq 0 ]]; then
+  msg ""
+  msg "$(c_grn '[OK] Сервер не RU и сломанных сервисов нет — WARP не нужен.')"; exit 0
 fi
 
-echo "" >&2
-echo "[!] Сломанные сервисы (поедут через '$WARP_TAG'):" >&2
-for r in "${BROKEN_REPORT[@]}"; do
-  echo "      - $r" >&2
-done
-echo "" >&2
-echo "[*] Готовый блок для секции routing.rules (вставь ВЫШЕ дефолтного маршрута):" >&2
-echo "" >&2
+if [[ ${#BROKEN_DOMAINS[@]} -gt 0 ]]; then
+  msg ""
+  msg "$(c_yel '[!] Сломанные сервисы:')"
+  for r in "${BROKEN_REPORT[@]}"; do msg "      - $r"; done
+fi
 
-# сортируем домены для стабильного вывода
+# =========================== ШАГ 3: WARP ==================================
+WARP_IF=""
+if need wg; then
+  WARP_IF="$(wg show interfaces 2>/dev/null | tr ' ' '\n' | grep -v '^$' | head -1)"
+fi
+
+WARP_OK="unknown"; WARP_LOC=""
+if [[ -z "$WARP_IF" ]]; then
+  msg ""
+  msg "$(c_yel '[!] WARP-интерфейс не найден (WARP не установлен/не поднят).')"
+else
+  msg ""
+  msg "$(c_cyn '[*] Найден WARP-интерфейс: ')$(c_grn "$WARP_IF")$(c_cyn '. Проверяю выход...')"
+  TRACE="$(curl --interface "$WARP_IF" -s --max-time 12 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)"
+  WARP_LOC="$(grep -oE '^loc=[A-Z]{2}' <<<"$TRACE" | cut -d= -f2)"
+  WARP_COLO="$(grep -oE '^colo=[A-Z]{3}' <<<"$TRACE" | cut -d= -f2)"
+  WARP_IP="$(grep -oE '^ip=[0-9a-fA-F:.]+' <<<"$TRACE" | cut -d= -f2)"
+  if [[ -z "$WARP_LOC" ]]; then
+    msg "$(c_red '[!] Не удалось определить страну WARP (нет ответа через интерфейс).')"
+  else
+    msg "$(c_cyn '    WARP выходит как:') $(c_grn "$WARP_LOC")  $(c_yel "(дата-центр: ${WARP_COLO:-?}, IP: ${WARP_IP:-?})")"
+    if in_list "$WARP_LOC" "${BAD_COUNTRIES[@]}"; then
+      WARP_OK="bad"
+    else
+      WARP_OK="good"
+    fi
+  fi
+fi
+
+# =========================== ШАГ 4: ВЕРДИКТ ===============================
+# Сервер RU: спасение только если WARP даёт не-RU
+if $SERVER_IS_RU; then
+  if [[ "$WARP_OK" == "good" ]]; then
+    msg ""
+    msg "$(c_grn "[OK] Сервер RU, но WARP выходит как $WARP_LOC — спасаемо через WARP.")"
+  else
+    msg ""
+    msg "$(c_red '======================================================')"
+    msg "$(c_red '[!] Сервер определяется как РОССИЯ, и WARP не спасает')"
+    msg "$(c_red "    (WARP: ${WARP_LOC:-нет/недоступен}).")"
+    msg "$(c_red '    Работа невозможна. Сервер для задачи не подходит.')"
+    msg "$(c_red '======================================================')"
+    exit 2
+  fi
+fi
+
+# Сервер не-RU, но WARP вышел в плохую страну — предупреждаем
+if [[ "$WARP_OK" == "bad" ]]; then
+  msg ""
+  msg "$(c_red "[!] WARP выходит в нерабочую страну ($WARP_LOC) — чинить через него бесполезно.")"
+  msg "$(c_red '    Нужен другой выход. Блок ниже работать не будет.')"
+  exit 3
+fi
+
+# Дошли сюда — есть что чинить и (WARP good, либо WARP unknown но сервер не-RU)
+if [[ ${#BROKEN_DOMAINS[@]} -eq 0 ]]; then
+  msg ""
+  msg "$(c_grn '[OK] Чинить нечего.')"; exit 0
+fi
+
+msg ""
+if [[ "$WARP_OK" == "good" ]]; then
+  msg "$(c_cyn '[*] Готовый блок для routing.rules (вставь ВЫШЕ дефолтного маршрута):')"
+else
+  msg "$(c_yel '[*] Предварительный блок (WARP не подтверждён — проверь страну WARP сам!):')"
+fi
+msg ""
+
 mapfile -t SORTED < <(printf '%s\n' "${!BROKEN_DOMAINS[@]}" | sort)
-
-# собираем JSON-массив доменов через jq и оборачиваем в правило
-printf '%s\n' "${SORTED[@]}" | jq -R . | jq -s \
-  --arg tag "$WARP_TAG" '{
-    type: "field",
-    domain: .,
-    outboundTag: $tag
-  }'
+printf '%s\n' "${SORTED[@]}" | jq -R . | jq -s --arg tag "$WARP_TAG" '{type:"field", domain:., outboundTag:$tag}'
