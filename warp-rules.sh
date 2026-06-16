@@ -360,148 +360,86 @@ MOTD
 
 # =========================== РЕЖИМ 3: ИНСТРУМЕНТЫ ==========================
 mode_install_tools(){
-  # Проверяем/ставим whiptail
-  local use_whiptail=true
-  if ! need whiptail; then
-    msg "$(c_cyn '[*] whiptail не найден, устанавливаю...')"
-    apt-get install -y whiptail >/dev/null 2>&1
-    need whiptail || { msg "$(c_yel '[!] whiptail недоступен — текстовое меню.')"; use_whiptail=false; }
-  fi
+  while :; do
+    # Проверяем состояние каждый раз в начале итерации
+    local has_remnawave=false has_trafficguard=false has_reshala=false has_multitest=false
+    command -v remnawave_reverse >/dev/null 2>&1 && has_remnawave=true
+    command -v rknpidor          >/dev/null 2>&1 && has_trafficguard=true
+    command -v reshala           >/dev/null 2>&1 && has_reshala=true
+    command -v multitest         >/dev/null 2>&1 && has_multitest=true
 
-  # Состояние инструментов
-  local has_remnawave=false has_trafficguard=false has_reshala=false \
-        has_multitest=false has_rwbackup=false
-  command -v remnawave_reverse >/dev/null 2>&1 && has_remnawave=true
-  command -v rknpidor          >/dev/null 2>&1 && has_trafficguard=true
-  command -v reshala           >/dev/null 2>&1 && has_reshala=true
-  command -v multitest         >/dev/null 2>&1 && has_multitest=true
-  command -v rw-backup         >/dev/null 2>&1 && has_rwbackup=true
+    # Собираем список неустановленных
+    local -a KEYS=() LABELS=()
+    $has_remnawave    || { KEYS+=("remnawave");    LABELS+=("Remnawave"); }
+    $has_trafficguard || { KEYS+=("trafficguard"); LABELS+=("TrafficGuard"); }
+    $has_reshala      || { KEYS+=("reshala");      LABELS+=("Решала"); }
+    $has_multitest    || { KEYS+=("multitest");    LABELS+=("Multitest"); }
 
-  local -a CHOICES=()
+    if [[ ${#KEYS[@]} -eq 0 ]]; then
+      msg "$(c_grn '[✓] Все инструменты уже установлены.')"
+      return 0
+    fi
 
-  if $use_whiptail; then
-    local lbl_rw="Remnawave (скрипт EGames)"
-    local lbl_tg="TrafficGuard"
-    local lbl_rs="Решала (настройки)"
-    local lbl_mt="Multitest (тесты скорости)"
-    $has_remnawave    && lbl_rw+=" (установлен)"
-    $has_trafficguard && lbl_tg+=" (установлен)"
-    $has_reshala      && lbl_rs+=" (установлен)"
-    $has_multitest    && lbl_mt+=" (установлен)"
-
-    local st_rw st_tg st_rs st_mt
-    $has_remnawave    && st_rw=ON || st_rw=OFF
-    $has_trafficguard && st_tg=ON || st_tg=OFF
-    $has_reshala      && st_rs=ON || st_rs=OFF
-    $has_multitest    && st_mt=ON || st_mt=OFF
-
-    local -a ITEMS=(
-      "remnawave"    "$lbl_rw" "$st_rw"
-      "trafficguard" "$lbl_tg" "$st_tg"
-      "reshala"      "$lbl_rs" "$st_rs"
-      "multitest"    "$lbl_mt" "$st_mt"
-    )
-    $has_remnawave && ! $has_rwbackup && \
-      ITEMS+=("rw-backup" "rw-backup (бэкапы Remnawave) — диагностика" "OFF")
-
-    local num_items=$(( ${#ITEMS[@]} / 3 ))
-    local HEIGHT=$(( num_items + 8 ))
-    local RESULT
-    RESULT="$(whiptail --title "Установка инструментов" \
-      --checklist "Выбери инструменты (SPACE — отметить, ENTER — ОК):" \
-      "$HEIGHT" 72 "$num_items" \
-      "${ITEMS[@]}" 3>&1 1>&2 2>&3)" || return 0
-
-    read -ra CHOICES <<< "$RESULT"
-    CHOICES=("${CHOICES[@]//\"/}")
-  else
     msg ""
-    msg "$(c_cyn '=== Установка инструментов ===')"
-    msg "  1. Remnawave$(     $has_remnawave    && echo ' (установлен)' || echo '')"
-    msg "  2. TrafficGuard$(  $has_trafficguard && echo ' (установлен)' || echo '')"
-    msg "  3. Решала$(        $has_reshala      && echo ' (установлен)' || echo '')"
-    msg "  4. Multitest$(     $has_multitest    && echo ' (установлен)' || echo '')"
-    $has_remnawave && ! $has_rwbackup && \
-      msg "  5. rw-backup (диагностика — устанавливается с Remnawave)"
-    msg "  0. Назад"
-    printf '%s' "$(c_yel '[?] Номера через пробел (напр. 1 3): ')" >&2
-    local input
-    read -r input < /dev/tty 2>/dev/null || return 1
-    local num
-    for num in $input; do
-      case "$num" in
-        1) CHOICES+=("remnawave") ;;
-        2) CHOICES+=("trafficguard") ;;
-        3) CHOICES+=("reshala") ;;
-        4) CHOICES+=("multitest") ;;
-        5) $has_remnawave && ! $has_rwbackup && CHOICES+=("rw-backup") ;;
-        0) return 0 ;;
-      esac
+    msg "$(c_cyn '──── Установка инструментов ────')"
+    local i
+    for (( i=0; i<${#KEYS[@]}; i++ )); do
+      msg "  $(( i+1 )). ${LABELS[$i]}"
     done
-  fi
+    msg "  0. Назад"
+    msg "$(c_cyn '────────────────────────────────────')"
+    printf '%s' "$(c_yel '[?] Выбор: ')" >&2
+    local choice
+    read -r choice < /dev/tty 2>/dev/null || return 1
 
-  # Установка выбранных инструментов
-  local tool
-  for tool in "${CHOICES[@]}"; do
-    case "$tool" in
+    [[ "$choice" == "0" ]] && return 0
+
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || \
+       (( choice < 1 || choice > ${#KEYS[@]} )); then
+      msg "$(c_red 'Неверный выбор, повтори.')"
+      continue
+    fi
+
+    local key="${KEYS[$(( choice - 1 ))]}"
+    case "$key" in
       remnawave)
-        if $has_remnawave; then
-          msg "$(c_yel '[!] Remnawave уже установлен — пропускаю.')"
+        msg "$(c_cyn '[*] Устанавливаю Remnawave...')"
+        if bash <(curl -Ls https://raw.githubusercontent.com/eGamesAPI/remnawave-reverse-proxy/refs/heads/main/install_remnawave.sh); then
+          msg "$(c_grn '[✓] Remnawave установлен.')"
+          update_motd
         else
-          msg "$(c_cyn '[*] Устанавливаю Remnawave...')"
-          if bash <(curl -Ls https://raw.githubusercontent.com/eGamesAPI/remnawave-reverse-proxy/refs/heads/main/install_remnawave.sh); then
-            msg "$(c_grn '[✓] Remnawave установлен.')"
-            update_motd
-          else
-            msg "$(c_red '[✗] Ошибка установки Remnawave.')"
-          fi
+          msg "$(c_red '[✗] Ошибка установки Remnawave.')"
         fi
         ;;
       trafficguard)
-        if $has_trafficguard; then
-          msg "$(c_yel '[!] TrafficGuard уже установлен — пропускаю.')"
+        msg "$(c_cyn '[*] Устанавливаю TrafficGuard...')"
+        if curl -fsSL https://raw.githubusercontent.com/DonMatteoVPN/TrafficGuard-auto/refs/heads/main/install-trafficguard.sh | bash; then
+          msg "$(c_grn '[✓] TrafficGuard установлен.')"
+          update_motd
         else
-          msg "$(c_cyn '[*] Устанавливаю TrafficGuard...')"
-          if curl -fsSL https://raw.githubusercontent.com/DonMatteoVPN/TrafficGuard-auto/refs/heads/main/install-trafficguard.sh | sudo bash; then
-            msg "$(c_grn '[✓] TrafficGuard установлен.')"
-            update_motd
-          else
-            msg "$(c_red '[✗] Ошибка установки TrafficGuard.')"
-          fi
+          msg "$(c_red '[✗] Ошибка установки TrafficGuard.')"
         fi
         ;;
       reshala)
-        if $has_reshala; then
-          msg "$(c_yel '[!] Решала уже установлена — пропускаю.')"
+        msg "$(c_cyn '[*] Устанавливаю Решалу...')"
+        if wget -4 -O /tmp/install_reshala.sh \
+            https://raw.githubusercontent.com/DonMatteoVPN/Reshala-Remnawave-Bedolaga/main/install.sh \
+            && RESHALA_NO_AUTOSTART=1 bash /tmp/install_reshala.sh; then
+          msg "$(c_grn '[✓] Решала установлена.')"
+          update_motd
         else
-          msg "$(c_cyn '[*] Устанавливаю Решалу...')"
-          if wget -4 -O /tmp/install_reshala.sh \
-              https://raw.githubusercontent.com/DonMatteoVPN/Reshala-Remnawave-Bedolaga/main/install.sh \
-              && RESHALA_NO_AUTOSTART=1 bash /tmp/install_reshala.sh; then
-            msg "$(c_grn '[✓] Решала установлена.')"
-            update_motd
-          else
-            msg "$(c_red '[✗] Ошибка установки Решалы.')"
-          fi
+          msg "$(c_red '[✗] Ошибка установки Решалы.')"
         fi
         ;;
       multitest)
-        if $has_multitest; then
-          msg "$(c_yel '[!] Multitest уже установлен — пропускаю.')"
+        msg "$(c_cyn '[*] Устанавливаю Multitest...')"
+        if curl -sL https://raw.githubusercontent.com/saveksme/multitest/master/multitest.sh \
+            -o /usr/local/bin/multitest && chmod +x /usr/local/bin/multitest; then
+          msg "$(c_grn '[✓] Multitest установлен.')"
+          update_motd
         else
-          msg "$(c_cyn '[*] Устанавливаю Multitest...')"
-          if curl -sL https://raw.githubusercontent.com/saveksme/multitest/master/multitest.sh \
-              -o /usr/local/bin/multitest && chmod +x /usr/local/bin/multitest; then
-            msg "$(c_grn '[✓] Multitest установлен.')"
-            update_motd
-          else
-            msg "$(c_red '[✗] Ошибка установки Multitest.')"
-          fi
+          msg "$(c_red '[✗] Ошибка установки Multitest.')"
         fi
-        ;;
-      rw-backup)
-        msg "$(c_yel '[!] rw-backup устанавливается вместе с Remnawave.')"
-        msg "$(c_yel '    Переустанови Remnawave (пункт 1) для диагностики.')"
         ;;
     esac
   done
@@ -535,7 +473,7 @@ main(){
     case "$choice" in
       1) mode_analyze; return $? ;;
       2) mode_test_warp; return $? ;;
-      3) mode_install_tools; return $? ;;
+      3) mode_install_tools ;;
       0) msg "Выход."; return 0 ;;
       *) msg "$(c_red 'Неверный выбор, повтори.')" ;;
     esac
