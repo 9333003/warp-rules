@@ -361,38 +361,44 @@ MOTD
 # =========================== РЕЖИМ 3: ИНСТРУМЕНТЫ ==========================
 mode_install_tools(){
   while :; do
-    # Проверяем состояние каждый раз в начале итерации
     local has_remnawave=false has_trafficguard=false has_reshala=false has_multitest=false
     command -v remnawave_reverse >/dev/null 2>&1 && has_remnawave=true
     command -v rknpidor          >/dev/null 2>&1 && has_trafficguard=true
     command -v reshala           >/dev/null 2>&1 && has_reshala=true
     command -v multitest         >/dev/null 2>&1 && has_multitest=true
 
-    # Собираем список неустановленных
     local -a KEYS=() LABELS=()
     $has_remnawave    || { KEYS+=("remnawave");    LABELS+=("Remnawave"); }
     $has_trafficguard || { KEYS+=("trafficguard"); LABELS+=("TrafficGuard"); }
     $has_reshala      || { KEYS+=("reshala");      LABELS+=("Решала"); }
     $has_multitest    || { KEYS+=("multitest");    LABELS+=("Multitest"); }
 
-    if [[ ${#KEYS[@]} -eq 0 ]]; then
-      msg "$(c_grn '[✓] Все инструменты уже установлены.')"
-      return 0
-    fi
-
     msg ""
     msg "$(c_cyn '──── Установка инструментов ────')"
-    local i
-    for (( i=0; i<${#KEYS[@]}; i++ )); do
-      msg "  $(( i+1 )). ${LABELS[$i]}"
-    done
+    $has_remnawave    && msg "  $(c_grn '[✓]') Remnawave"
+    $has_trafficguard && msg "  $(c_grn '[✓]') TrafficGuard"
+    $has_reshala      && msg "  $(c_grn '[✓]') Решала"
+    $has_multitest    && msg "  $(c_grn '[✓]') Multitest"
+
+    if [[ ${#KEYS[@]} -gt 0 ]]; then
+      local any_inst=false
+      $has_remnawave || $has_trafficguard || $has_reshala || $has_multitest && any_inst=true
+      $any_inst && msg ""
+      local i
+      for (( i=0; i<${#KEYS[@]}; i++ )); do
+        msg "  $(( i+1 )). ${LABELS[$i]}"
+      done
+    fi
     msg "  0. Назад"
     msg "$(c_cyn '────────────────────────────────────')"
+    [[ ${#KEYS[@]} -eq 0 ]] && msg "$(c_grn '[✓] Все инструменты установлены.')"
+
     printf '%s' "$(c_yel '[?] Выбор: ')" >&2
     local choice
     read -r choice < /dev/tty 2>/dev/null || return 1
 
     [[ "$choice" == "0" ]] && return 0
+    [[ ${#KEYS[@]} -eq 0 ]] && continue
 
     if ! [[ "$choice" =~ ^[0-9]+$ ]] || \
        (( choice < 1 || choice > ${#KEYS[@]} )); then
@@ -445,6 +451,22 @@ mode_install_tools(){
   done
 }
 
+# =========================== БЫСТРЫЕ КОМАНДЫ ==============================
+show_hints(){
+  local any=false
+  command -v remnawave_reverse >/dev/null 2>&1 && { any=true
+    msg "$(c_yel '⚡️ Быстрый запуск скрипта EGames:') $(c_grn 'remnawave_reverse')  (или $(c_grn 'rr'))"; }
+  command -v rknpidor >/dev/null 2>&1 && { any=true
+    msg "$(c_yel '⚡️ Быстрый запуск TrafficGuard:') $(c_cyn 'rknpidor')"; }
+  command -v reshala >/dev/null 2>&1 && { any=true
+    msg "$(c_yel '⚡️ Быстрый запуск Решалы (настройки):') $(c_grn 'reshala')  («РЕШАЛА»)"; }
+  command -v multitest >/dev/null 2>&1 && { any=true
+    msg "$(c_yel '⚡️ Быстрый запуск тестов:') $(c_cyn 'multitest')"; }
+  command -v rw-backup >/dev/null 2>&1 && { any=true
+    msg "$(c_yel '⚡️ Быстрый запуск бэкапов Remnawave:') $(c_grn 'rw-backup')"; }
+  $any && msg ""
+}
+
 # =========================== МЕНЮ =========================================
 show_menu(){
   msg ""
@@ -474,7 +496,7 @@ main(){
       1) mode_analyze; return $? ;;
       2) mode_test_warp; return $? ;;
       3) mode_install_tools ;;
-      0) msg "Выход."; return 0 ;;
+      0) show_hints; msg "Выход."; return 0 ;;
       *) msg "$(c_red 'Неверный выбор, повтори.')" ;;
     esac
   done
