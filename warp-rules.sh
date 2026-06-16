@@ -607,19 +607,29 @@ opt_hybrid_memory(){
   msg "  RAM: $(c_grn "${ram_mb} MB")  →  ZRAM: $(c_grn "${zram_pct}%")  +  Swap: $(c_grn "${swap_mb} MB")"
   msg ""
 
-  if ! need zramswap && ! dpkg -l zram-tools >/dev/null 2>&1; then
-    msg "$(c_yel '[*] Устанавливаю zram-tools...')"
-    opt_run apt-get update -qq >/dev/null 2>&1
-    opt_run apt-get install -y zram-tools >/dev/null 2>&1 \
-      || { msg "$(c_red '[!] Не удалось установить zram-tools.')"; return 1; }
+  # --- ZRAM (только если ядро поддерживает модуль) ---
+  local zram_ok=0
+  if ! modinfo zram >/dev/null 2>&1 && [ ! -e /sys/class/zram-control ]; then
+    msg "$(c_yel '[!] Модуль zram недоступен в этом ядре — ZRAM пропущен.')"
+    msg "$(c_yel '    Будет настроен только дисковый swap.')"
+  else
+    if ! dpkg -l zram-tools >/dev/null 2>&1; then
+      msg "$(c_yel '[*] Устанавливаю zram-tools...')"
+      opt_run apt-get install -y zram-tools >/dev/null 2>&1
+    fi
+    msg "$(c_yel '[*] Настраиваю ZRAM...')"
+    printf 'ALGO=zstd\nPERCENT=%s\nPRIORITY=100\n' "$zram_pct" | opt_run tee /etc/default/zramswap >/dev/null
+    opt_run systemctl enable zramswap >/dev/null 2>&1
+    opt_run systemctl restart zramswap >/dev/null 2>&1
+    if swapon --show 2>/dev/null | grep -q zram; then
+      msg "$(c_grn '[✓] ZRAM включён (zstd, приоритет 100).')"
+      zram_ok=1
+    else
+      msg "$(c_red '[!] ZRAM не поднялся (ядро без модуля zram?). Останется только swap.')"
+    fi
   fi
 
-  msg "$(c_yel '[*] Настраиваю ZRAM...')"
-  printf 'ALGO=zstd\nPERCENT=%s\nPRIORITY=100\n' "$zram_pct" | opt_run tee /etc/default/zramswap >/dev/null
-  opt_run systemctl restart zramswap >/dev/null 2>&1
-  opt_run systemctl enable  zramswap >/dev/null 2>&1
-  msg "$(c_grn '[✓] ZRAM включён (zstd, приоритет 100).')"
-
+  # --- Дисковый swap (страховка, низкий приоритет) ---
   if swapon --show 2>/dev/null | grep -q '/swapfile'; then
     msg "$(c_yel '[*] /swapfile уже есть — выставляю приоритет -2.')"
     opt_run swapoff /swapfile 2>/dev/null || true
@@ -636,12 +646,14 @@ opt_hybrid_memory(){
   if ! grep -qE '^/swapfile[[:space:]]' /etc/fstab 2>/dev/null; then
     echo '/swapfile none swap sw,pri=-2 0 0' | opt_run tee -a /etc/fstab >/dev/null
   fi
+  msg "$(c_grn '[✓] Swap настроен (приоритет -2).')"
 
-  opt_run sysctl -w vm.swappiness=10 >/dev/null 2>&1
-  if ! grep -q 'vm.swappiness' /etc/sysctl.conf 2>/dev/null; then
-    echo 'vm.swappiness=10' | opt_run tee -a /etc/sysctl.conf >/dev/null
-  fi
-  msg "$(c_grn '[✓] Swap настроен (приоритет -2, swappiness=10).')"
+  # --- vm.swappiness: 100 с ZRAM, 10 без ---
+  local swappiness
+  if [ "${zram_ok}" -eq 1 ]; then swappiness=100; else swappiness=10; fi
+  echo "vm.swappiness=${swappiness}" | opt_run tee /etc/sysctl.d/99-swappiness.conf >/dev/null
+  opt_run sysctl -w "vm.swappiness=${swappiness}" >/dev/null 2>&1
+  msg "$(c_grn "[✓] vm.swappiness=${swappiness}.")"
 }
 
 # ----------------------------------------------------------------------------
