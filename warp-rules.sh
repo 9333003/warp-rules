@@ -332,30 +332,32 @@ mode_test_warp(){
 
 # =========================== ДАШБОРД MOTD ==================================
 update_motd(){
-  local f="/etc/update-motd.d/99-remnawave-hint"
-  cat > "$f" << 'MOTD'
+  cat > /etc/update-motd.d/99-remnawave-hint << 'MOTD_EOF'
 #!/bin/sh
 YEL='\033[1;33m'
 GRN='\033[1;32m'
 LBLU='\033[1;34m'
+RED='\033[1;31m'
 RST='\033[0m'
-MOTD
-  command -v remnawave_reverse >/dev/null 2>&1 && cat >> "$f" << 'MOTD'
-printf "${YEL}⚡️ Быстрый запуск скрипта EGames:${RST} ${GRN}remnawave_reverse${RST}  (или ${GRN}rr${RST})\n"
-MOTD
-  command -v rw-backup >/dev/null 2>&1 && cat >> "$f" << 'MOTD'
-printf "${YEL}⚡️ Быстрый запуск бэкапов Remnawave:${RST} ${GRN}rw-backup${RST}\n"
-MOTD
-  command -v reshala >/dev/null 2>&1 && cat >> "$f" << 'MOTD'
-printf "${YEL}⚡️ Быстрый запуск Решалы (настройки):${RST} ${GRN}reshala${RST}  («РЕШАЛА»)\n"
-MOTD
-  command -v rknpidor >/dev/null 2>&1 && cat >> "$f" << 'MOTD'
-printf "${YEL}⚡️ Быстрый запуск TrafficGuard:${RST} ${LBLU}rknpidor${RST}\n"
-MOTD
-  command -v multitest >/dev/null 2>&1 && cat >> "$f" << 'MOTD'
-printf "${YEL}⚡️ Быстрый запуск тестов:${RST} ${LBLU}multitest${RST}\n"
-MOTD
-  chmod +x "$f"
+MOTD_EOF
+  command -v remnawave_reverse >/dev/null 2>&1 && \
+    printf 'printf "${YEL}⚡️ Быстрый запуск скрипта EGames:${RST}     ${GRN}remnawave_reverse${RST} (или ${GRN}rr${RST})\\n"\n' \
+    >> /etc/update-motd.d/99-remnawave-hint
+  command -v rw-backup >/dev/null 2>&1 && \
+    printf 'printf "${YEL}⚡️ Быстрый запуск бэкапов Remnawave:${RST}  ${GRN}rw-backup${RST}\\n"\n' \
+    >> /etc/update-motd.d/99-remnawave-hint
+  command -v reshala >/dev/null 2>&1 && \
+    printf 'printf "${YEL}⚡️ Быстрый запуск Решалы:${RST}             ${GRN}reshala${RST}\\n"\n' \
+    >> /etc/update-motd.d/99-remnawave-hint
+  command -v rknpidor >/dev/null 2>&1 && \
+    printf 'printf "${YEL}⚡️ Быстрый запуск TrafficGuard:${RST}       ${LBLU}rknpidor${RST}\\n"\n' \
+    >> /etc/update-motd.d/99-remnawave-hint
+  command -v multitest >/dev/null 2>&1 && \
+    printf 'printf "${YEL}⚡️ Быстрый запуск тестов:${RST}             ${LBLU}multitest${RST}\\n"\n' \
+    >> /etc/update-motd.d/99-remnawave-hint
+  printf 'printf "${YEL}⚡️ Быстрый запуск WARP Rules:${RST}         ${RED}warp${RST}\\n\\n"\n' \
+    >> /etc/update-motd.d/99-remnawave-hint
+  chmod +x /etc/update-motd.d/99-remnawave-hint
 }
 
 # =========================== РЕЖИМ 3: ИНСТРУМЕНТЫ ==========================
@@ -570,7 +572,7 @@ main(){
       1) mode_analyze; return $? ;;
       2) mode_test_warp; return $? ;;
       3) mode_install_tools ;;
-      0) show_hints; msg "Выход."; return 0 ;;
+      0) show_hints; update_motd; msg "Выход."; return 0 ;;
       *) msg "$(c_red 'Неверный выбор, повтори.')" ;;
     esac
   done
