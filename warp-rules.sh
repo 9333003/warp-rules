@@ -341,19 +341,19 @@ LBLU='\033[1;34m'
 RST='\033[0m'
 MOTD
   command -v remnawave_reverse >/dev/null 2>&1 && cat >> "$f" << 'MOTD'
-printf "${YEL}⚡️ Быстрый запуск скрипта EGames:\n${RST} ${GRN}remnawave_reverse${RST}  (или ${GRN}rr${RST})\n"
+printf "${YEL}⚡️ Быстрый запуск скрипта EGames:${RST} ${GRN}remnawave_reverse${RST}  (или ${GRN}rr${RST})\n"
 MOTD
   command -v rknpidor >/dev/null 2>&1 && cat >> "$f" << 'MOTD'
-printf "${YEL}⚡️ Быстрый запуск TrafficGuard:\n${RST} ${LBLU}rknpidor${RST}\n\n"
+printf "${YEL}⚡️ Быстрый запуск TrafficGuard:${RST} ${LBLU}rknpidor${RST}\n"
 MOTD
   command -v reshala >/dev/null 2>&1 && cat >> "$f" << 'MOTD'
-printf "${YEL}⚡️ Быстрый запуск Решалы (настройки):\n${RST} ${GRN}reshala${RST}  («РЕШАЛА»)\n"
+printf "${YEL}⚡️ Быстрый запуск Решалы (настройки):${RST} ${GRN}reshala${RST}  («РЕШАЛА»)\n"
 MOTD
   command -v multitest >/dev/null 2>&1 && cat >> "$f" << 'MOTD'
-printf "${YEL}⚡️ Быстрый запуск тестов:\n${RST} ${LBLU}multitest${RST}\n\n"
+printf "${YEL}⚡️ Быстрый запуск тестов:${RST} ${LBLU}multitest${RST}\n"
 MOTD
   command -v rw-backup >/dev/null 2>&1 && cat >> "$f" << 'MOTD'
-printf "${YEL}⚡️ Быстрый запуск бэкапов Remnawave:\n${RST} ${GRN}rw-backup${RST}\n\n"
+printf "${YEL}⚡️ Быстрый запуск бэкапов Remnawave:${RST} ${GRN}rw-backup${RST}\n"
 MOTD
   chmod +x "$f"
 }
@@ -477,7 +477,7 @@ mode_install_tools(){
           msg "$(c_cyn '[*] Устанавливаю Решалу...')"
           if wget -4 -O /tmp/install_reshala.sh \
               https://raw.githubusercontent.com/DonMatteoVPN/Reshala-Remnawave-Bedolaga/main/install.sh \
-              && bash /tmp/install_reshala.sh; then
+              && RESHALA_NO_AUTOSTART=1 bash /tmp/install_reshala.sh; then
             msg "$(c_grn '[✓] Решала установлена.')"
             update_motd
           else
