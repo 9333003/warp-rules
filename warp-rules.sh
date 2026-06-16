@@ -496,7 +496,7 @@ show_hints(){
     msg "$(c_yel '⚡️ Быстрый запуск тестов:') $(c_cyn 'multitest')"; }
   command -v warp >/dev/null 2>&1 \
     && grep -q 'warp-rules' "$(command -v warp)" 2>/dev/null && { any=true
-    msg "$(c_yel '⚡️ Быстрый запуск этого скрипта:') $(c_red 'warp')"; }
+    msg "$(c_yel '⚡️ Быстрый запуск скрипта WARP Rules:') $(c_red 'warp')"; }
   $any && msg ""
 }
 
