@@ -467,6 +467,20 @@ mode_install_tools(){
   done
 }
 
+# =========================== АЛИАС warp ====================================
+install_warp_alias(){
+  local target="/usr/local/bin/warp"
+  # Уже установлен нами — пропускаем
+  [[ -f "$target" ]] && grep -q 'warp-rules' "$target" 2>/dev/null && return 0
+  # Конфликт с другой командой warp — не трогаем
+  command -v warp >/dev/null 2>&1 && return 1
+  cat > "$target" << 'EOF'
+#!/usr/bin/env bash
+bash <(curl -fsSL https://raw.githubusercontent.com/9333003/warp-rules/main/warp-rules.sh) "$@"
+EOF
+  chmod +x "$target"
+}
+
 # =========================== БЫСТРЫЕ КОМАНДЫ ==============================
 show_hints(){
   local any=false
@@ -480,6 +494,9 @@ show_hints(){
     msg "$(c_yel '⚡️ Быстрый запуск TrafficGuard:') $(c_cyn 'rknpidor')"; }
   command -v multitest >/dev/null 2>&1 && { any=true
     msg "$(c_yel '⚡️ Быстрый запуск тестов:') $(c_cyn 'multitest')"; }
+  command -v warp >/dev/null 2>&1 \
+    && grep -q 'warp-rules' "$(command -v warp)" 2>/dev/null && { any=true
+    msg "$(c_yel '⚡️ Быстрый запуск этого скрипта:') $(c_red 'warp')"; }
   $any && msg ""
 }
 
@@ -496,6 +513,7 @@ show_menu(){
 
 main(){
   parse_ipregion_args "$@"
+  install_warp_alias 2>/dev/null || true
   local choice="${1:-}"
 
   # если первый аргумент 1/2/3 — запустить сразу, без меню
