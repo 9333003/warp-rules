@@ -415,7 +415,13 @@ mode_install_tools(){
     case "$key" in
       remnawave)
         msg "$(c_cyn '[*] Устанавливаю Remnawave...')"
-        if bash <(curl -Ls https://raw.githubusercontent.com/eGamesAPI/remnawave-reverse-proxy/refs/heads/main/install_remnawave.sh); then
+        local rmnw_dir="/usr/local/remnawave_reverse"
+        if mkdir -p "$rmnw_dir" \
+            && curl -fsSL https://raw.githubusercontent.com/eGamesAPI/remnawave-reverse-proxy/refs/heads/main/install_remnawave.sh \
+               -o "$rmnw_dir/install_remnawave.sh" \
+            && chmod +x "$rmnw_dir/install_remnawave.sh" \
+            && ln -sf "$rmnw_dir/install_remnawave.sh" /usr/local/bin/remnawave_reverse \
+            && ln -sf "$rmnw_dir/install_remnawave.sh" /usr/local/bin/rr; then
           msg "$(c_grn '[✓] Remnawave установлен.')"
           update_motd
         else
@@ -424,7 +430,9 @@ mode_install_tools(){
         ;;
       trafficguard)
         msg "$(c_cyn '[*] Устанавливаю TrafficGuard...')"
-        if curl -fsSL https://raw.githubusercontent.com/DonMatteoVPN/TrafficGuard-auto/refs/heads/main/install-trafficguard.sh | bash; then
+        if curl -fsSL https://raw.githubusercontent.com/DonMatteoVPN/TrafficGuard-auto/refs/heads/main/install-trafficguard.sh \
+               -o /tmp/install_trafficguard.sh \
+            && head -n -1 /tmp/install_trafficguard.sh | bash; then
           msg "$(c_grn '[✓] TrafficGuard установлен.')"
           update_motd
         else
@@ -444,9 +452,12 @@ mode_install_tools(){
         ;;
       rw-backup)
         msg "$(c_cyn '[*] Устанавливаю rw-backup...')"
-        if curl -o ~/backup-restore.sh \
-            https://raw.githubusercontent.com/distillium/remnawave-backup-restore/main/backup-restore.sh \
-            && chmod +x ~/backup-restore.sh && ~/backup-restore.sh; then
+        local rw_dir="/opt/rw-backup-restore"
+        if mkdir -p "$rw_dir" \
+            && curl -fsSL https://raw.githubusercontent.com/distillium/remnawave-backup-restore/main/backup-restore.sh \
+               -o "$rw_dir/backup-restore.sh" \
+            && chmod +x "$rw_dir/backup-restore.sh" \
+            && ln -sf "$rw_dir/backup-restore.sh" /usr/local/bin/rw-backup; then
           msg "$(c_grn '[✓] rw-backup установлен.')"
           update_motd
         else
