@@ -549,6 +549,7 @@ show_menu(){
   msg "  1. Анализ сервера + блок для конфига"
   msg "  2. Проверка пригодности WARP (до установки)"
   msg "  3. Установка инструментов (Remnawave / TrafficGuard / Решала / Multitest)"
+  msg "  4. Оптимизация (память, docker-лимиты, логи)"
   msg "  0. Выход"
   msg "$(c_cyn '════════════════════════════════════')"
 }
@@ -562,17 +563,251 @@ main(){
   if [[ "$choice" == "1" ]]; then mode_analyze; return $?; fi
   if [[ "$choice" == "2" ]]; then mode_test_warp; return $?; fi
   if [[ "$choice" == "3" ]]; then mode_install_tools; return $?; fi
+  if [[ "$choice" == "4" ]]; then mode_optimization; return $?; fi
 
   # иначе показать меню и читать выбор с терминала
   while :; do
     show_menu
-    printf '%s' "$(c_yel '[?] Выбор (0-3): ')" >&2
-    read -r choice < /dev/tty 2>/dev/null || { msg ""; msg "Нет терминала. Запусти: bash warp-rules.sh 1  (или 2, 3)"; return 1; }
+    printf '%s' "$(c_yel '[?] Выбор (0-4): ')" >&2
+    read -r choice < /dev/tty 2>/dev/null || { msg ""; msg "Нет терминала. Запусти: bash warp-rules.sh 1  (или 2, 3, 4)"; return 1; }
     case "$choice" in
       1) mode_analyze; return $? ;;
       2) mode_test_warp; return $? ;;
       3) mode_install_tools ;;
+      4) mode_optimization ;;
       0) show_hints; update_motd; msg "Выход."; return 0 ;;
+      *) msg "$(c_red 'Неверный выбор, повтори.')" ;;
+    esac
+  done
+}
+
+# =========================== МОДУЛЬ: ОПТИМИЗАЦИЯ ============================
+
+# выполнить команду с sudo, если не root
+opt_run(){ if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
+
+# запустить python3 от root, сохраняя окружение
+opt_py(){ if [[ $EUID -eq 0 ]]; then python3 -; else sudo -E python3 -; fi; }
+
+# ----------------------------------------------------------------------------
+# 1. ГИБРИДНАЯ ПАМЯТЬ: ZRAM (приоритет 100) + disk swap (приоритет -2)
+# ----------------------------------------------------------------------------
+opt_hybrid_memory(){
+  local ram_mb
+  ram_mb=$(( $(grep MemTotal /proc/meminfo | awk '{print $2}') / 1024 ))
+
+  local zram_pct swap_mb
+  if   [ "$ram_mb" -le 1024 ]; then zram_pct=60; swap_mb=1024
+  elif [ "$ram_mb" -le 2048 ]; then zram_pct=50; swap_mb=1024
+  elif [ "$ram_mb" -le 4096 ]; then zram_pct=40; swap_mb=2048
+  else                              zram_pct=25; swap_mb=2048
+  fi
+
+  msg "$(c_cyn '─── Гибридная память (ZRAM + Swap) ───')"
+  msg "  RAM: $(c_grn "${ram_mb} MB")  →  ZRAM: $(c_grn "${zram_pct}%")  +  Swap: $(c_grn "${swap_mb} MB")"
+  msg ""
+
+  if ! need zramswap && ! dpkg -l zram-tools >/dev/null 2>&1; then
+    msg "$(c_yel '[*] Устанавливаю zram-tools...')"
+    opt_run apt-get update -qq >/dev/null 2>&1
+    opt_run apt-get install -y zram-tools >/dev/null 2>&1 \
+      || { msg "$(c_red '[!] Не удалось установить zram-tools.')"; return 1; }
+  fi
+
+  msg "$(c_yel '[*] Настраиваю ZRAM...')"
+  printf 'ALGO=zstd\nPERCENT=%s\nPRIORITY=100\n' "$zram_pct" | opt_run tee /etc/default/zramswap >/dev/null
+  opt_run systemctl restart zramswap >/dev/null 2>&1
+  opt_run systemctl enable  zramswap >/dev/null 2>&1
+  msg "$(c_grn '[✓] ZRAM включён (zstd, приоритет 100).')"
+
+  if swapon --show 2>/dev/null | grep -q '/swapfile'; then
+    msg "$(c_yel '[*] /swapfile уже есть — выставляю приоритет -2.')"
+    opt_run swapoff /swapfile 2>/dev/null || true
+    opt_run swapon -p -2 /swapfile 2>/dev/null || true
+  else
+    msg "$(c_yel "[*] Создаю /swapfile (${swap_mb} MB)...")"
+    opt_run fallocate -l "${swap_mb}M" /swapfile 2>/dev/null \
+      || opt_run dd if=/dev/zero of=/swapfile bs=1M count="${swap_mb}" status=none
+    opt_run chmod 600 /swapfile
+    opt_run mkswap /swapfile >/dev/null 2>&1
+    opt_run swapon -p -2 /swapfile 2>/dev/null || opt_run swapon /swapfile
+  fi
+
+  if ! grep -qE '^/swapfile[[:space:]]' /etc/fstab 2>/dev/null; then
+    echo '/swapfile none swap sw,pri=-2 0 0' | opt_run tee -a /etc/fstab >/dev/null
+  fi
+
+  opt_run sysctl -w vm.swappiness=10 >/dev/null 2>&1
+  if ! grep -q 'vm.swappiness' /etc/sysctl.conf 2>/dev/null; then
+    echo 'vm.swappiness=10' | opt_run tee -a /etc/sysctl.conf >/dev/null
+  fi
+  msg "$(c_grn '[✓] Swap настроен (приоритет -2, swappiness=10).')"
+}
+
+# ----------------------------------------------------------------------------
+# 2. ЛИМИТЫ RAM ДЛЯ remnanode (docker-compose)
+# ----------------------------------------------------------------------------
+opt_find_compose(){
+  local f d
+  for d in /root /opt /srv /home; do
+    f=$(find "$d" -maxdepth 4 -name 'docker-compose.y*ml' 2>/dev/null | head -n1)
+    [[ -n "$f" ]] && { printf '%s' "$f"; return 0; }
+  done
+  return 1
+}
+
+opt_docker_limits(){
+  local cf
+  cf=$(opt_find_compose) || {
+    msg "$(c_red '[!] docker-compose.yml не найден в стандартных местах.')"
+    printf '%s' "$(c_yel '[?] Укажи путь вручную (Enter = пропустить): ')" >&2
+    local p; read -r p < /dev/tty 2>/dev/null
+    [[ -z "$p" ]] && return 1
+    cf="$p"
+  }
+
+  msg "$(c_cyn '─── Лимиты RAM для remnanode ───')"
+  msg "  Файл: $(c_grn "$cf")"
+
+  local ram_mb
+  ram_mb=$(( $(grep MemTotal /proc/meminfo | awk '{print $2}') / 1024 ))
+  local lim res heap
+  if   [ "$ram_mb" -le 1024 ]; then lim="512m";  res="256m";  heap=400
+  elif [ "$ram_mb" -le 2048 ]; then lim="768m";  res="384m";  heap=640
+  elif [ "$ram_mb" -le 4096 ]; then lim="1024m"; res="512m";  heap=896
+  else                              lim="2048m"; res="1024m"; heap=1792
+  fi
+  msg "  RAM: $(c_grn "${ram_mb} MB")  →  limit: $(c_grn "$lim")  reservation: $(c_grn "$res")  heap: $(c_grn "${heap} MB")"
+  msg ""
+
+  opt_run cp "$cf" "${cf}.bak.$(date +%Y%m%d_%H%M%S)"
+
+  if need python3 && python3 -c 'import yaml' 2>/dev/null; then
+    if MEM_LIMIT="$lim" MEM_RESERV="$res" NODE_HEAP="$heap" COMPOSE_FILE="$cf" \
+         opt_py <<'PYEOF'
+import os, sys, yaml
+p=os.environ["COMPOSE_FILE"]; lim=os.environ["MEM_LIMIT"]
+res=os.environ["MEM_RESERV"]; heap=os.environ["NODE_HEAP"]
+d=yaml.safe_load(open(p))
+if not isinstance(d,dict) or "services" not in d: sys.exit("no services")
+s=d["services"].get("remnanode")
+if s is None: sys.exit("no remnanode")
+opt=f"--max-old-space-size={heap}"
+env=s.get("environment")
+if env is None: s["environment"]=[f"NODE_OPTIONS={opt}"]
+elif isinstance(env,list):
+    env=[e for e in env if not str(e).startswith("NODE_OPTIONS")]; env.append(f"NODE_OPTIONS={opt}"); s["environment"]=env
+elif isinstance(env,dict): env["NODE_OPTIONS"]=opt
+deploy=s.setdefault("deploy",{}); res_d=deploy.setdefault("resources",{})
+res_d["limits"]={"memory":lim}; res_d["reservations"]={"memory":res}
+yaml.dump(d,open(p,"w"),default_flow_style=False,allow_unicode=True)
+print("ok")
+PYEOF
+    then
+      msg "$(c_grn '[✓] docker-compose.yml обновлён.')"
+    else
+      msg "$(c_red '[!] Ошибка патча — добавь вручную в секцию remnanode:')"
+      msg "$(c_cyn "    environment:")"
+      msg "$(c_cyn "      - NODE_OPTIONS=--max-old-space-size=${heap}")"
+      msg "$(c_cyn "    deploy:")"
+      msg "$(c_cyn "      resources:")"
+      msg "$(c_cyn "        limits:")"
+      msg "$(c_cyn "          memory: ${lim}")"
+      msg "$(c_cyn "        reservations:")"
+      msg "$(c_cyn "          memory: ${res}")"
+      return 0
+    fi
+  else
+    msg "$(c_yel '[!] python3-yaml не найден. Добавь вручную в секцию remnanode:')"
+    msg "$(c_cyn "    environment:")"
+    msg "$(c_cyn "      - NODE_OPTIONS=--max-old-space-size=${heap}")"
+    msg "$(c_cyn "    deploy:")"
+    msg "$(c_cyn "      resources:")"
+    msg "$(c_cyn "        limits:")"
+    msg "$(c_cyn "          memory: ${lim}")"
+    msg "$(c_cyn "        reservations:")"
+    msg "$(c_cyn "          memory: ${res}")"
+    return 0
+  fi
+
+  printf '%s' "$(c_yel '[?] Перезапустить ноду сейчас? (y/N): ')" >&2
+  local ans; read -r ans < /dev/tty 2>/dev/null
+  if [[ "$ans" =~ ^[yYдД]$ ]]; then
+    ( cd "$(dirname "$cf")" && opt_run docker compose down && opt_run docker compose up -d )
+    msg "$(c_grn '[✓] Нода перезапущена.')"
+  else
+    msg "$(c_yel "[i] Перезапусти позже: cd $(dirname "$cf") && docker compose down && docker compose up -d")"
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# 3. РОТАЦИЯ ЛОГОВ (Docker daemon.json + journald)
+# ----------------------------------------------------------------------------
+opt_log_rotation(){
+  msg "$(c_cyn '─── Ротация логов ───')"
+
+  local dcfg="/etc/docker/daemon.json"
+  [[ -f "$dcfg" ]] && opt_run cp "$dcfg" "${dcfg}.bak.$(date +%Y%m%d_%H%M%S)"
+
+  if need python3 && python3 -c 'import json' 2>/dev/null; then
+    DOCKER_CFG="$dcfg" opt_py <<'PYEOF'
+import os, json
+p=os.environ["DOCKER_CFG"]
+try: d=json.load(open(p))
+except: d={}
+d.setdefault("log-driver","json-file"); d.setdefault("log-opts",{})
+d["log-opts"]["max-size"]="10m"; d["log-opts"]["max-file"]="3"
+json.dump(d,open(p,"w"),indent=2); print("ok")
+PYEOF
+    msg "$(c_grn '[✓] Docker: log-driver=json-file, max-size=10m, max-file=3.')"
+  else
+    opt_run mkdir -p /etc/docker
+    if [[ -s "$dcfg" ]]; then
+      msg "$(c_yel "[i] $dcfg уже есть — добавь вручную: \"log-driver\":\"json-file\",\"log-opts\":{\"max-size\":\"10m\",\"max-file\":\"3\"}")"
+    else
+      printf '{\n  "log-driver": "json-file",\n  "log-opts": {"max-size": "10m", "max-file": "3"}\n}\n' \
+        | opt_run tee "$dcfg" >/dev/null
+      msg "$(c_grn '[✓] /etc/docker/daemon.json создан.')"
+    fi
+  fi
+  need docker && { opt_run systemctl reload docker 2>/dev/null || opt_run systemctl restart docker 2>/dev/null || true; }
+
+  local jcfg="/etc/systemd/journald.conf"
+  if [[ -f "$jcfg" ]]; then
+    opt_run sed -i \
+      -e 's/^#\?SystemMaxUse=.*/SystemMaxUse=200M/' \
+      -e 's/^#\?RuntimeMaxUse=.*/RuntimeMaxUse=50M/' \
+      "$jcfg"
+    grep -q '^SystemMaxUse='  "$jcfg" || echo 'SystemMaxUse=200M'  | opt_run tee -a "$jcfg" >/dev/null
+    grep -q '^RuntimeMaxUse=' "$jcfg" || echo 'RuntimeMaxUse=50M'  | opt_run tee -a "$jcfg" >/dev/null
+    opt_run systemctl restart systemd-journald 2>/dev/null || true
+    msg "$(c_grn '[✓] journald: SystemMaxUse=200M, RuntimeMaxUse=50M.')"
+  else
+    msg "$(c_yel '[!] /etc/systemd/journald.conf не найден — пропускаю.')"
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# МЕНЮ МОДУЛЯ "ОПТИМИЗАЦИЯ"
+# ----------------------------------------------------------------------------
+mode_optimization(){
+  while :; do
+    msg ""
+    msg "$(c_cyn '══════════  Оптимизация  ══════════')"
+    msg "  1. Гибридная память (ZRAM + Swap)"
+    msg "  2. Лимиты RAM для remnanode (docker-compose)"
+    msg "  3. Ротация логов (Docker + journald)"
+    msg "  4. Применить всё сразу"
+    msg "  0. Назад"
+    msg "$(c_cyn '═══════════════════════════════════')"
+    printf '%s' "$(c_yel '[?] Выбор (0-4): ')" >&2
+    local choice; read -r choice < /dev/tty 2>/dev/null || return 1
+    case "$choice" in
+      1) opt_hybrid_memory ;;
+      2) opt_docker_limits ;;
+      3) opt_log_rotation ;;
+      4) opt_hybrid_memory; opt_docker_limits; opt_log_rotation ;;
+      0) return 0 ;;
       *) msg "$(c_red 'Неверный выбор, повтори.')" ;;
     esac
   done
