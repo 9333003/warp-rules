@@ -415,13 +415,12 @@ mode_install_tools(){
     case "$key" in
       remnawave)
         msg "$(c_cyn '[*] Устанавливаю Remnawave...')"
-        local rmnw_dir="/usr/local/remnawave_reverse"
-        if mkdir -p "$rmnw_dir" \
-            && curl -fsSL https://raw.githubusercontent.com/eGamesAPI/remnawave-reverse-proxy/refs/heads/main/install_remnawave.sh \
-               -o "$rmnw_dir/install_remnawave.sh" \
-            && chmod +x "$rmnw_dir/install_remnawave.sh" \
-            && ln -sf "$rmnw_dir/install_remnawave.sh" /usr/local/bin/remnawave_reverse \
-            && ln -sf "$rmnw_dir/install_remnawave.sh" /usr/local/bin/rr; then
+        if { cat > /usr/local/bin/remnawave_reverse << 'WRAPPER'
+#!/usr/bin/env bash
+bash <(curl -fsSL https://raw.githubusercontent.com/eGamesAPI/remnawave-reverse-proxy/refs/heads/main/install_remnawave.sh) "$@"
+WRAPPER
+        } && chmod +x /usr/local/bin/remnawave_reverse \
+          && ln -sf /usr/local/bin/remnawave_reverse /usr/local/bin/rr; then
           msg "$(c_grn '[✓] Remnawave установлен.')"
           update_motd
         else
@@ -429,37 +428,62 @@ mode_install_tools(){
         fi
         ;;
       trafficguard)
-        msg "$(c_cyn '[*] Устанавливаю TrafficGuard...')"
+        msg "$(c_cyn '[*] Устанавливаю TrafficGuard (первичная настройка системы)...')"
+        local _tg_tmp; _tg_tmp=$(mktemp)
         if curl -fsSL https://raw.githubusercontent.com/DonMatteoVPN/TrafficGuard-auto/refs/heads/main/install-trafficguard.sh \
-               -o /tmp/install_trafficguard.sh \
-            && chmod +x /tmp/install_trafficguard.sh \
-            && sed -i '/trafficguard-manager\.sh[[:space:]]*monitor/d' /tmp/install_trafficguard.sh \
-            && bash /tmp/install_trafficguard.sh; then
-          msg "$(c_grn '[✓] TrafficGuard установлен.')"
-          update_motd
+               -o "$_tg_tmp" \
+            && sed -i '/trafficguard-manager\.sh[[:space:]]*monitor/d' "$_tg_tmp" \
+            && bash "$_tg_tmp"; then
+          rm -f "$_tg_tmp"
+          if { cat > /usr/local/bin/rknpidor << 'WRAPPER'
+#!/usr/bin/env bash
+_tg=$(mktemp)
+curl -fsSL https://raw.githubusercontent.com/DonMatteoVPN/TrafficGuard-auto/refs/heads/main/install-trafficguard.sh \
+  -o "$_tg" 2>/dev/null \
+  && sed -i '/trafficguard-manager\.sh[[:space:]]*monitor/d' "$_tg" \
+  && bash "$_tg" >/dev/null 2>&1
+rm -f "$_tg"
+exec /opt/trafficguard-manager.sh monitor
+WRAPPER
+          } && chmod +x /usr/local/bin/rknpidor; then
+            msg "$(c_grn '[✓] TrafficGuard установлен.')"
+            update_motd
+          else
+            msg "$(c_red '[✗] Ошибка создания враппера rknpidor.')"
+          fi
         else
+          rm -f "$_tg_tmp"
           msg "$(c_red '[✗] Ошибка установки TrafficGuard.')"
         fi
         ;;
       reshala)
-        msg "$(c_cyn '[*] Устанавливаю Решалу...')"
-        if wget -4 -O /tmp/install_reshala.sh \
+        msg "$(c_cyn '[*] Устанавливаю Решалу (первичная настройка)...')"
+        if wget -4 -q -O /tmp/install_reshala.sh \
             https://raw.githubusercontent.com/DonMatteoVPN/Reshala-Remnawave-Bedolaga/main/install.sh \
             && RESHALA_NO_AUTOSTART=1 bash /tmp/install_reshala.sh; then
-          msg "$(c_grn '[✓] Решала установлена.')"
-          update_motd
+          rm -f /tmp/install_reshala.sh
+          if { cat > /usr/local/bin/reshala << 'WRAPPER'
+#!/usr/bin/env bash
+bash <(curl -fsSL https://raw.githubusercontent.com/DonMatteoVPN/Reshala-Remnawave-Bedolaga/main/install.sh) "$@"
+WRAPPER
+          } && chmod +x /usr/local/bin/reshala; then
+            msg "$(c_grn '[✓] Решала установлена.')"
+            update_motd
+          else
+            msg "$(c_red '[✗] Ошибка создания враппера reshala.')"
+          fi
         else
+          rm -f /tmp/install_reshala.sh
           msg "$(c_red '[✗] Ошибка установки Решалы.')"
         fi
         ;;
       rw-backup)
         msg "$(c_cyn '[*] Устанавливаю rw-backup...')"
-        local rw_dir="/opt/rw-backup-restore"
-        if mkdir -p "$rw_dir" \
-            && curl -fsSL https://raw.githubusercontent.com/distillium/remnawave-backup-restore/main/backup-restore.sh \
-               -o "$rw_dir/backup-restore.sh" \
-            && chmod +x "$rw_dir/backup-restore.sh" \
-            && ln -sf "$rw_dir/backup-restore.sh" /usr/local/bin/rw-backup; then
+        if { cat > /usr/local/bin/rw-backup << 'WRAPPER'
+#!/usr/bin/env bash
+bash <(curl -fsSL https://raw.githubusercontent.com/distillium/remnawave-backup-restore/main/backup-restore.sh) "$@"
+WRAPPER
+        } && chmod +x /usr/local/bin/rw-backup; then
           msg "$(c_grn '[✓] rw-backup установлен.')"
           update_motd
         else
@@ -468,8 +492,11 @@ mode_install_tools(){
         ;;
       multitest)
         msg "$(c_cyn '[*] Устанавливаю Multitest...')"
-        if curl -sL https://raw.githubusercontent.com/saveksme/multitest/master/multitest.sh \
-            -o /usr/local/bin/multitest && chmod +x /usr/local/bin/multitest; then
+        if { cat > /usr/local/bin/multitest << 'WRAPPER'
+#!/usr/bin/env bash
+bash <(curl -fsSL https://raw.githubusercontent.com/saveksme/multitest/master/multitest.sh) "$@"
+WRAPPER
+        } && chmod +x /usr/local/bin/multitest; then
           msg "$(c_grn '[✓] Multitest установлен.')"
           update_motd
         else
