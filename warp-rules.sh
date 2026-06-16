@@ -656,6 +656,16 @@ opt_find_compose(){
   return 1
 }
 
+opt_ensure_ruamel(){
+  python3 -c 'from ruamel.yaml import YAML' 2>/dev/null && return 0
+  msg "$(c_yel '[*] Устанавливаю ruamel.yaml...')"
+  opt_run apt-get install -y python3-ruamel.yaml -qq >/dev/null 2>&1 \
+    && python3 -c 'from ruamel.yaml import YAML' 2>/dev/null && return 0
+  python3 -m pip install --break-system-packages -q ruamel.yaml 2>/dev/null \
+    && python3 -c 'from ruamel.yaml import YAML' 2>/dev/null && return 0
+  return 1
+}
+
 opt_docker_limits(){
   local cf
   cf=$(opt_find_compose) || {
@@ -680,54 +690,83 @@ opt_docker_limits(){
   msg "  RAM: $(c_grn "${ram_mb} MB")  →  limit: $(c_grn "$lim")  reservation: $(c_grn "$res")  heap: $(c_grn "${heap} MB")"
   msg ""
 
-  opt_run cp "$cf" "${cf}.bak.$(date +%Y%m%d_%H%M%S)"
+  if ! opt_ensure_ruamel; then
+    msg "$(c_red '[!] ruamel.yaml недоступен — файл не изменён.')"
+    msg "$(c_yel '[i] Добавь вручную в секцию remnanode:')"
+    msg "$(c_cyn "      - NODE_OPTIONS=--max-old-space-size=${heap}")"
+    msg "$(c_cyn "    deploy: {resources: {limits: {memory: ${lim}}, reservations: {memory: ${res}}}}")"
+    return 1
+  fi
 
-  if need python3 && python3 -c 'import yaml' 2>/dev/null; then
-    if MEM_LIMIT="$lim" MEM_RESERV="$res" NODE_HEAP="$heap" COMPOSE_FILE="$cf" \
-         opt_py <<'PYEOF'
-import os, sys, yaml
-p=os.environ["COMPOSE_FILE"]; lim=os.environ["MEM_LIMIT"]
-res=os.environ["MEM_RESERV"]; heap=os.environ["NODE_HEAP"]
-d=yaml.safe_load(open(p))
-if not isinstance(d,dict) or "services" not in d: sys.exit("no services")
-s=d["services"].get("remnanode")
-if s is None: sys.exit("no remnanode")
-opt=f"--max-old-space-size={heap}"
-env=s.get("environment")
-if env is None: s["environment"]=[f"NODE_OPTIONS={opt}"]
-elif isinstance(env,list):
-    env=[e for e in env if not str(e).startswith("NODE_OPTIONS")]; env.append(f"NODE_OPTIONS={opt}"); s["environment"]=env
-elif isinstance(env,dict): env["NODE_OPTIONS"]=opt
-deploy=s.setdefault("deploy",{}); res_d=deploy.setdefault("resources",{})
-res_d["limits"]={"memory":lim}; res_d["reservations"]={"memory":res}
-yaml.dump(d,open(p,"w"),default_flow_style=False,allow_unicode=True)
+  local bak="${cf}.bak.$(date +%Y%m%d_%H%M%S)"
+  opt_run cp "$cf" "$bak"
+  msg "  Бэкап: $(c_grn "$bak")"
+
+  if MEM_LIMIT="$lim" MEM_RESERV="$res" NODE_HEAP="$heap" COMPOSE_FILE="$cf" \
+       opt_py <<'PYEOF'
+import os, sys
+try:
+    from ruamel.yaml import YAML
+    from ruamel.yaml.comments import CommentedMap, CommentedSeq
+except ImportError:
+    sys.exit("no_ruamel")
+
+p       = os.environ["COMPOSE_FILE"]
+lim     = os.environ["MEM_LIMIT"]
+res     = os.environ["MEM_RESERV"]
+new_opt = "NODE_OPTIONS=--max-old-space-size=" + os.environ["NODE_HEAP"]
+
+yml = YAML()
+yml.preserve_quotes = True
+yml.indent(mapping=2, sequence=4, offset=2)
+
+with open(p) as fh:
+    d = yml.load(fh)
+
+if not isinstance(d, dict) or "services" not in d:
+    sys.exit("no_services")
+svc = d["services"].get("remnanode")
+if svc is None:
+    sys.exit("no_remnanode")
+
+env = svc.get("environment")
+if env is None:
+    svc["environment"] = CommentedSeq([new_opt])
+elif hasattr(env, "items"):
+    env["NODE_OPTIONS"] = new_opt.split("=", 1)[1]
+else:
+    for i, v in enumerate(env):
+        if str(v).startswith("NODE_OPTIONS="):
+            env[i] = new_opt
+            break
+    else:
+        env.append(new_opt)
+
+dep = svc.setdefault("deploy", CommentedMap())
+rsc = dep.setdefault("resources", CommentedMap())
+rsc["limits"]       = CommentedMap({"memory": lim})
+rsc["reservations"] = CommentedMap({"memory": res})
+
+with open(p, "w") as fh:
+    yml.dump(d, fh)
 print("ok")
 PYEOF
-    then
-      msg "$(c_grn '[✓] docker-compose.yml обновлён.')"
-    else
-      msg "$(c_red '[!] Ошибка патча — добавь вручную в секцию remnanode:')"
-      msg "$(c_cyn "    environment:")"
-      msg "$(c_cyn "      - NODE_OPTIONS=--max-old-space-size=${heap}")"
-      msg "$(c_cyn "    deploy:")"
-      msg "$(c_cyn "      resources:")"
-      msg "$(c_cyn "        limits:")"
-      msg "$(c_cyn "          memory: ${lim}")"
-      msg "$(c_cyn "        reservations:")"
-      msg "$(c_cyn "          memory: ${res}")"
-      return 0
-    fi
+  then
+    msg "$(c_grn '[✓] docker-compose.yml обновлён.')"
   else
-    msg "$(c_yel '[!] python3-yaml не найден. Добавь вручную в секцию remnanode:')"
-    msg "$(c_cyn "    environment:")"
-    msg "$(c_cyn "      - NODE_OPTIONS=--max-old-space-size=${heap}")"
-    msg "$(c_cyn "    deploy:")"
-    msg "$(c_cyn "      resources:")"
-    msg "$(c_cyn "        limits:")"
-    msg "$(c_cyn "          memory: ${lim}")"
-    msg "$(c_cyn "        reservations:")"
-    msg "$(c_cyn "          memory: ${res}")"
-    return 0
+    msg "$(c_red '[!] Ошибка патча — откатываю из бэкапа.')"
+    opt_run cp "$bak" "$cf"
+    return 1
+  fi
+
+  if need docker; then
+    msg "$(c_yel '[*] Валидирую через docker compose config...')"
+    if ! docker compose -f "$cf" config --quiet >/dev/null 2>&1; then
+      msg "$(c_red '[!] Валидация не прошла — откатываю из бэкапа.')"
+      opt_run cp "$bak" "$cf"
+      return 1
+    fi
+    msg "$(c_grn '[✓] Валидация прошла.')"
   fi
 
   printf '%s' "$(c_yel '[?] Перезапустить ноду сейчас? (y/N): ')" >&2
@@ -741,37 +780,10 @@ PYEOF
 }
 
 # ----------------------------------------------------------------------------
-# 3. РОТАЦИЯ ЛОГОВ (Docker daemon.json + journald)
+# 3. РОТАЦИЯ ЛОГОВ journald
 # ----------------------------------------------------------------------------
 opt_log_rotation(){
-  msg "$(c_cyn '─── Ротация логов ───')"
-
-  local dcfg="/etc/docker/daemon.json"
-  [[ -f "$dcfg" ]] && opt_run cp "$dcfg" "${dcfg}.bak.$(date +%Y%m%d_%H%M%S)"
-
-  if need python3 && python3 -c 'import json' 2>/dev/null; then
-    DOCKER_CFG="$dcfg" opt_py <<'PYEOF'
-import os, json
-p=os.environ["DOCKER_CFG"]
-try: d=json.load(open(p))
-except: d={}
-d.setdefault("log-driver","json-file"); d.setdefault("log-opts",{})
-d["log-opts"]["max-size"]="10m"; d["log-opts"]["max-file"]="3"
-json.dump(d,open(p,"w"),indent=2); print("ok")
-PYEOF
-    msg "$(c_grn '[✓] Docker: log-driver=json-file, max-size=10m, max-file=3.')"
-  else
-    opt_run mkdir -p /etc/docker
-    if [[ -s "$dcfg" ]]; then
-      msg "$(c_yel "[i] $dcfg уже есть — добавь вручную: \"log-driver\":\"json-file\",\"log-opts\":{\"max-size\":\"10m\",\"max-file\":\"3\"}")"
-    else
-      printf '{\n  "log-driver": "json-file",\n  "log-opts": {"max-size": "10m", "max-file": "3"}\n}\n' \
-        | opt_run tee "$dcfg" >/dev/null
-      msg "$(c_grn '[✓] /etc/docker/daemon.json создан.')"
-    fi
-  fi
-  need docker && { opt_run systemctl reload docker 2>/dev/null || opt_run systemctl restart docker 2>/dev/null || true; }
-
+  msg "$(c_cyn '─── Ротация логов journald ───')"
   local jcfg="/etc/systemd/journald.conf"
   if [[ -f "$jcfg" ]]; then
     opt_run sed -i \
@@ -796,7 +808,7 @@ mode_optimization(){
     msg "$(c_cyn '══════════  Оптимизация  ══════════')"
     msg "  1. Гибридная память (ZRAM + Swap)"
     msg "  2. Лимиты RAM для remnanode (docker-compose)"
-    msg "  3. Ротация логов (Docker + journald)"
+    msg "  3. Ротация логов journald"
     msg "  4. Применить всё сразу"
     msg "  0. Назад"
     msg "$(c_cyn '═══════════════════════════════════')"
