@@ -433,7 +433,8 @@ mode_install_tools(){
         if curl -fsSL https://raw.githubusercontent.com/DonMatteoVPN/TrafficGuard-auto/refs/heads/main/install-trafficguard.sh \
                -o /tmp/install_trafficguard.sh \
             && chmod +x /tmp/install_trafficguard.sh \
-            && bash /tmp/install_trafficguard.sh install; then
+            && sed -i '/trafficguard-manager\.sh[[:space:]]*monitor/d' /tmp/install_trafficguard.sh \
+            && bash /tmp/install_trafficguard.sh; then
           msg "$(c_grn '[✓] TrafficGuard установлен.')"
           update_motd
         else
