@@ -694,10 +694,9 @@ opt_docker_limits(){
   local ram_mb
   ram_mb=$(( $(grep MemTotal /proc/meminfo | awk '{print $2}') / 1024 ))
   local lim res heap
-  if   [ "$ram_mb" -le 1024 ]; then lim="512m";  res="256m";  heap=400
-  elif [ "$ram_mb" -le 2048 ]; then lim="768m";  res="384m";  heap=640
-  elif [ "$ram_mb" -le 4096 ]; then lim="1024m"; res="512m";  heap=896
-  else                              lim="2048m"; res="1024m"; heap=1792
+  if   [ "$ram_mb" -le 1024 ]; then lim="768m";  res="256m";  heap=256
+  elif [ "$ram_mb" -le 2048 ]; then lim="1536m"; res="512m";  heap=512
+  else                              lim="3072m"; res="1024m"; heap=1024
   fi
   msg "  RAM: $(c_grn "${ram_mb} MB")  →  limit: $(c_grn "$lim")  reservation: $(c_grn "$res")  heap: $(c_grn "${heap} MB")"
   msg ""
