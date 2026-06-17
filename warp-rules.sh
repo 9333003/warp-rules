@@ -522,14 +522,13 @@ WRAPPER
 # =========================== АЛИАС wrules ====================================
 install_warp_alias(){
   local target="/usr/local/bin/wrules"
-  # Уже установлен нами — пропускаем
+  # Наш файл уже есть — пропускаем
   [[ -f "$target" ]] && grep -q 'warp-rules' "$target" 2>/dev/null && return 0
-  # Конфликт с другой командой wrules — не трогаем
+  # Чужой файл с таким именем — не трогаем
+  [[ -f "$target" ]] && return 1
+  # В PATH есть wrules, но не наш — не трогаем
   command -v wrules >/dev/null 2>&1 && return 1
-  # WARP Native (distillium) присутствует — не создавать наш алиас
-  [[ -f /opt/warp-native/warp-watchdog.sh ]] && return 1
-  command -v warp >/dev/null 2>&1 \
-    && ! grep -q 'warp-rules' "$(command -v warp)" 2>/dev/null && return 1
+  # Создаём
   cat > "$target" << 'EOF'
 #!/usr/bin/env bash
 bash <(curl -fsSL https://raw.githubusercontent.com/9333003/warp-rules/main/warp-rules.sh) "$@"
