@@ -516,6 +516,10 @@ install_warp_alias(){
   [[ -f "$target" ]] && grep -q 'warp-rules' "$target" 2>/dev/null && return 0
   # Конфликт с другой командой wrules — не трогаем
   command -v wrules >/dev/null 2>&1 && return 1
+  # WARP Native (distillium) присутствует — не создавать наш алиас
+  [[ -f /opt/warp-native/warp-watchdog.sh ]] && return 1
+  command -v warp >/dev/null 2>&1 \
+    && ! grep -q 'warp-rules' "$(command -v warp)" 2>/dev/null && return 1
   cat > "$target" << 'EOF'
 #!/usr/bin/env bash
 bash <(curl -fsSL https://raw.githubusercontent.com/9333003/warp-rules/main/warp-rules.sh) "$@"
@@ -539,6 +543,20 @@ show_hints(){
   command -v wrules >/dev/null 2>&1 \
     && grep -q 'warp-rules' "$(command -v wrules)" 2>/dev/null && { any=true
     msg "$(c_yel '⚡️ Быстрый запуск скрипта WARP Rules:') $(c_red 'wrules')"; }
+  local _warp_native=false
+  if [[ -f /opt/warp-native/warp-watchdog.sh ]]; then
+    _warp_native=true
+  elif command -v warp >/dev/null 2>&1 && ! grep -q 'warp-rules' "$(command -v warp)" 2>/dev/null; then
+    _warp_native=true
+  fi
+  if $_warp_native; then
+    any=true
+    if wg show warp 2>/dev/null | grep -q 'latest handshake'; then
+      msg "$(c_yel '⚡️ WARP Native (distillium):') $(c_grn 'активен') — warp"
+    else
+      msg "$(c_yel '⚡️ WARP Native (distillium):') $(c_red 'не активен') — warp"
+    fi
+  fi
   $any && msg ""
 }
 
