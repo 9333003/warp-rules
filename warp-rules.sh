@@ -339,24 +339,34 @@ GRN='\033[1;32m'
 LBLU='\033[1;34m'
 RED='\033[1;31m'
 RST='\033[0m'
+command -v remnawave_reverse >/dev/null 2>&1 && \
+  printf "${YEL}⚡️ Быстрый запуск скрипта EGames:${RST}     ${GRN}remnawave_reverse${RST} (или ${GRN}rr${RST})\n"
+command -v rw-backup >/dev/null 2>&1 && \
+  printf "${YEL}⚡️ Быстрый запуск бэкапов Remnawave:${RST}  ${GRN}rw-backup${RST}\n"
+command -v reshala >/dev/null 2>&1 && \
+  printf "${YEL}⚡️ Быстрый запуск Решалы:${RST}             ${GRN}reshala${RST}\n"
+command -v rknpidor >/dev/null 2>&1 && \
+  printf "${YEL}⚡️ Быстрый запуск TrafficGuard:${RST}       ${LBLU}rknpidor${RST}\n"
+command -v multitest >/dev/null 2>&1 && \
+  printf "${YEL}⚡️ Быстрый запуск тестов:${RST}             ${LBLU}multitest${RST}\n"
+if command -v wrules >/dev/null 2>&1 && grep -q 'warp-rules' "$(command -v wrules)" 2>/dev/null; then
+  printf "${YEL}⚡️ Быстрый запуск WARP Rules:${RST}         ${RED}wrules${RST}\n"
+fi
+_wn=false
+if [ -f /opt/warp-native/warp-watchdog.sh ]; then
+  _wn=true
+elif command -v warp >/dev/null 2>&1; then
+  case "$(cat "$(command -v warp)" 2>/dev/null)" in *warp-rules*) ;; *) _wn=true ;; esac
+fi
+if $_wn; then
+  if wg show warp 2>/dev/null | grep -q 'latest handshake'; then
+    printf "${YEL}⚡️ WARP Native (distillium):${RST} ${GRN}активен${RST} — warp\n"
+  else
+    printf "${YEL}⚡️ WARP Native (distillium):${RST} ${RED}не активен${RST} — warp\n"
+  fi
+fi
+printf "\n"
 MOTD_EOF
-  command -v remnawave_reverse >/dev/null 2>&1 && \
-    printf 'printf "${YEL}⚡️ Быстрый запуск скрипта EGames:${RST}     ${GRN}remnawave_reverse${RST} (или ${GRN}rr${RST})\\n"\n' \
-    >> /etc/update-motd.d/99-remnawave-hint
-  command -v rw-backup >/dev/null 2>&1 && \
-    printf 'printf "${YEL}⚡️ Быстрый запуск бэкапов Remnawave:${RST}  ${GRN}rw-backup${RST}\\n"\n' \
-    >> /etc/update-motd.d/99-remnawave-hint
-  command -v reshala >/dev/null 2>&1 && \
-    printf 'printf "${YEL}⚡️ Быстрый запуск Решалы:${RST}             ${GRN}reshala${RST}\\n"\n' \
-    >> /etc/update-motd.d/99-remnawave-hint
-  command -v rknpidor >/dev/null 2>&1 && \
-    printf 'printf "${YEL}⚡️ Быстрый запуск TrafficGuard:${RST}       ${LBLU}rknpidor${RST}\\n"\n' \
-    >> /etc/update-motd.d/99-remnawave-hint
-  command -v multitest >/dev/null 2>&1 && \
-    printf 'printf "${YEL}⚡️ Быстрый запуск тестов:${RST}             ${LBLU}multitest${RST}\\n"\n' \
-    >> /etc/update-motd.d/99-remnawave-hint
-  printf 'printf "${YEL}⚡️ Быстрый запуск WARP Rules:${RST}         ${RED}wrules${RST}\\n\\n"\n' \
-    >> /etc/update-motd.d/99-remnawave-hint
   chmod +x /etc/update-motd.d/99-remnawave-hint
 }
 
@@ -542,7 +552,7 @@ show_hints(){
     msg "$(c_yel '⚡️ Быстрый запуск тестов:') $(c_cyn 'multitest')"; }
   command -v wrules >/dev/null 2>&1 \
     && grep -q 'warp-rules' "$(command -v wrules)" 2>/dev/null && { any=true
-    msg "$(c_yel '⚡️ Быстрый запуск скрипта WARP Rules:') $(c_red 'wrules')"; }
+    msg "$(c_yel '⚡️ Быстрый запуск WARP Rules:') $(c_red 'wrules')"; }
   local _warp_native=false
   if [[ -f /opt/warp-native/warp-watchdog.sh ]]; then
     _warp_native=true
