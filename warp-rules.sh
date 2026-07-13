@@ -6,17 +6,23 @@
 #   1. Анализ сервера + генерация блока маршрутизации для WARP.
 #   2. Предварительная проверка пригодности WARP (до установки, с очисткой).
 #   3. Установка инструментов (Remnawave / TrafficGuard / Решала / Multitest).
+#   4. Оптимизация (память, docker-лимиты, логи).
+#   5. Фикс и обновление (диагностика apt update, автофикс известных
+#      ошибок, затем apt upgrade -y).
 #
 # Запуск:
 #   bash <(curl -fsSL .../warp-rules.sh)        # покажет меню
 #   bash warp-rules.sh 1                          # сразу режим 1
 #   bash warp-rules.sh 2                          # сразу режим 2
 #   bash warp-rules.sh 3                          # сразу режим 3
+#   bash warp-rules.sh 5                          # сразу режим 5
+#   bash warp-rules.sh 5 --auto                   # режим 5 без интерактивных вопросов (cron)
 #   bash warp-rules.sh 1 -- -t 5                  # аргументы после -- уходят в ipregion
 
 set -uo pipefail
 
 # =========================== НАСТРОЙКИ =====================================
+SCRIPT_VERSION="1.1.0"
 WARP_TAG="warp-out"
 IPREGION_URL="https://ipregion.vrnt.xyz"
 IPREGION_LOCAL="./ipregion.sh"
@@ -531,9 +537,23 @@ install_warp_alias(){
   # Создаём
   cat > "$target" << 'EOF'
 #!/usr/bin/env bash
+export WRULES_INVOKED=1
 bash <(curl -fsSL https://raw.githubusercontent.com/9333003/warp-rules/main/warp-rules.sh) "$@"
 EOF
   chmod +x "$target"
+}
+
+# при запуске через wrules скрипт всегда curl'ится заново (свежий с GitHub),
+# поэтому "проверка обновления" — это сравнение версии с прошлым запуском
+check_for_update(){
+  local state_file="${HOME}/.warp-rules-last-version"
+  local prev=""
+  [[ -f "$state_file" ]] && prev="$(cat "$state_file" 2>/dev/null)"
+  if [[ -n "$prev" && "$prev" != "$SCRIPT_VERSION" ]]; then
+    msg "$(c_grn "[✓] warp-rules обновлён: v${prev} → v${SCRIPT_VERSION}")"
+    msg ""
+  fi
+  printf '%s' "$SCRIPT_VERSION" > "$state_file" 2>/dev/null
 }
 
 # =========================== БЫСТРЫЕ КОМАНДЫ ==============================
@@ -577,6 +597,7 @@ show_menu(){
   msg "  2. Проверка пригодности WARP (до установки)"
   msg "  3. Установка инструментов (Remnawave / TrafficGuard / Решала / Multitest)"
   msg "  4. Оптимизация (память, docker-лимиты, логи)"
+  msg "  5. Фикс и обновление (диагностика apt update + автофикс + upgrade)"
   msg "  0. Выход"
   msg "$(c_cyn '════════════════════════════════════')"
 }
@@ -584,6 +605,7 @@ show_menu(){
 main(){
   parse_ipregion_args "$@"
   install_warp_alias 2>/dev/null || true
+  [[ -n "${WRULES_INVOKED:-}" ]] && check_for_update
   local choice="${1:-}"
 
   # если первый аргумент 1/2/3 — запустить сразу, без меню
@@ -591,17 +613,24 @@ main(){
   if [[ "$choice" == "2" ]]; then mode_test_warp; return $?; fi
   if [[ "$choice" == "3" ]]; then mode_install_tools; return $?; fi
   if [[ "$choice" == "4" ]]; then mode_optimization; return $?; fi
+  if [[ "$choice" == "5" ]]; then
+    local auto_flag=false a
+    for a in "$@"; do [[ "$a" == "--auto" ]] && auto_flag=true; done
+    if $auto_flag; then fix_and_update --auto; else fix_and_update; fi
+    return $?
+  fi
 
   # иначе показать меню и читать выбор с терминала
   while :; do
     show_menu
-    printf '%s' "$(c_yel '[?] Выбор (0-4): ')" >&2
-    read -r choice < /dev/tty 2>/dev/null || { msg ""; msg "Нет терминала. Запусти: bash warp-rules.sh 1  (или 2, 3, 4)"; return 1; }
+    printf '%s' "$(c_yel '[?] Выбор (0-5): ')" >&2
+    read -r choice < /dev/tty 2>/dev/null || { msg ""; msg "Нет терминала. Запусти: bash warp-rules.sh 1  (или 2, 3, 4, 5)"; return 1; }
     case "$choice" in
       1) mode_analyze; return $? ;;
       2) mode_test_warp; return $? ;;
       3) mode_install_tools ;;
       4) mode_optimization ;;
+      5) fix_and_update ;;
       0) show_hints; update_motd; msg "Выход."; return 0 ;;
       *) msg "$(c_red 'Неверный выбор, повтори.')" ;;
     esac
@@ -814,6 +843,199 @@ PYEOF
     msg "$(c_grn '[✓] Нода перезапущена.')"
   else
     msg "$(c_yel "[i] Перезапусти позже: cd $(dirname "$cf") && docker compose down && docker compose up -d")"
+  fi
+}
+
+# ============================ ФИКС И ОБНОВЛЕНИЕ ============================
+# известные "интерим"-кодовые имена Ubuntu без LTS-статуса —
+# при ошибке "does not have a Release file" откатываем на прошлый LTS.
+declare -A FAU_LTS_FALLBACK=(
+  [noble]="jammy"
+  [oracular]="jammy"
+  [mantic]="jammy"
+  [lunar]="jammy"
+  [kinetic]="jammy"
+)
+
+# a) репозиторий с неподдерживаемым codename ("does not have a Release file")
+fau_fix_release_file(){
+  local line="$1" url codename base suffix fallback new_codename file bak
+
+  if [[ "$line" =~ repository\ \'([^\']+)\'\ does\ not\ have\ a\ Release\ file ]]; then
+    local repo_desc="${BASH_REMATCH[1]}"
+    url="${repo_desc%% *}"
+    codename="$(awk '{print $2}' <<<"$repo_desc")"
+  else
+    msg "$(c_red "[?] Не удалось разобрать источник ошибки Release-файла: $line")"
+    return 1
+  fi
+
+  file="$(grep -rlF "$url" /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null | head -1)"
+  if [[ -z "$file" ]]; then
+    msg "$(c_red "[!] Не найден файл-источник для $url — фикс пропущен.")"
+    return 1
+  fi
+
+  if ! grep -q "$codename" "$file" 2>/dev/null; then
+    msg "$(c_grn "[✓] $file уже не содержит '$codename' — похоже, исправлено ранее.")"
+    return 0
+  fi
+
+  base="${codename%%-*}"; suffix="${codename#"$base"}"
+  fallback="${FAU_LTS_FALLBACK[$base]:-}"
+  if [[ -z "$fallback" ]]; then
+    msg "$(c_yel "[!] Кодовое имя '$codename' неизвестно — безопасная замена невозможна.")"
+    msg "$(c_yel "    Предлагаю отключить репозиторий вручную (закомментировать в $file):")"
+    msg "$(c_cyn "      sudo sed -i '\\|${url}|s/^deb/#deb/' $file")"
+    return 0
+  fi
+  new_codename="${fallback}${suffix}"
+
+  bak="${file}.bak.$(date +%Y%m%d_%H%M%S)"
+  opt_run cp "$file" "$bak"
+  if opt_run sed -i "s/\b${codename}\b/${new_codename}/g" "$file"; then
+    msg "$(c_grn "[✓] Исправлено: $file — codename '$codename' → '$new_codename' (бэкап: $bak)")"
+  else
+    msg "$(c_red "[!] Не удалось заменить codename в $file")"
+  fi
+}
+
+# b) отсутствующий GPG-ключ (NO_PUBKEY) — только показать команду, спросить подтверждение
+fau_fix_no_pubkey(){
+  local line="$1" auto="$2" keyid
+  keyid="$(grep -oE 'NO_PUBKEY [0-9A-Fa-f]+' <<<"$line" | awk '{print $2}')"
+  if [[ -z "$keyid" ]]; then
+    msg "$(c_red "[?] Не удалось извлечь ID ключа из: $line")"
+    return 1
+  fi
+
+  msg "$(c_yel "[!] Отсутствует GPG-ключ $keyid — репозиторий не проходит проверку подписи.")"
+  msg "$(c_yel '    Добавление чужого ключа — вопрос безопасности, автоматически не выполняется.')"
+  msg "$(c_cyn '    Современный способ (keyrings):')"
+  msg "$(c_cyn "      curl -fsSL 'https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${keyid}' | sudo gpg --dearmor -o /etc/apt/keyrings/${keyid}.gpg")"
+  msg "$(c_cyn '    Устаревший способ (apt-key, deprecated):')"
+  msg "$(c_cyn "      sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys ${keyid}")"
+
+  if $auto; then
+    msg "$(c_yel "[i] Режим --auto: ключ $keyid не добавлен, требуется ручное вмешательство.")"
+    return 0
+  fi
+
+  printf '%s' "$(c_yel "[?] Добавить ключ $keyid сейчас через keyserver.ubuntu.com? (y/N): ")" >&2
+  local ans; read -r ans < /dev/tty 2>/dev/null
+  if [[ "$ans" =~ ^[yYдД]$ ]]; then
+    if opt_run gpg --no-default-keyring --keyring "/etc/apt/keyrings/${keyid}.gpg" \
+         --keyserver keyserver.ubuntu.com --recv-keys "$keyid" >/dev/null 2>&1; then
+      msg "$(c_grn "[✓] Исправлено: ключ $keyid добавлен в /etc/apt/keyrings/${keyid}.gpg")"
+    else
+      msg "$(c_red "[!] Не удалось добавить ключ $keyid.")"
+    fi
+  else
+    msg "$(c_yel "[i] Ключ $keyid не добавлен — пропущено по решению пользователя.")"
+  fi
+}
+
+# c) битая строка в sources.list ("Malformed entry N in list file F")
+fau_fix_malformed(){
+  local line="$1" lineno file bad_line bak
+  if [[ "$line" =~ Malformed\ entry\ ([0-9]+)\ in\ list\ file\ ([^\ ]+) ]]; then
+    lineno="${BASH_REMATCH[1]}"; file="${BASH_REMATCH[2]}"
+  else
+    msg "$(c_red "[?] Не удалось разобрать Malformed entry: $line")"
+    return 1
+  fi
+
+  if [[ ! -f "$file" ]]; then
+    msg "$(c_red "[!] Файл $file не найден — фикс пропущен.")"
+    return 1
+  fi
+
+  bad_line="$(sed -n "${lineno}p" "$file")"
+  if [[ "$bad_line" == \#* ]]; then
+    msg "$(c_grn "[✓] Строка $lineno в $file уже закомментирована — пропускаю.")"
+    return 0
+  fi
+
+  msg "$(c_yel "[!] Битая строка $lineno в $file:")"
+  msg "$(c_yel "      $bad_line")"
+
+  bak="${file}.bak.$(date +%Y%m%d_%H%M%S)"
+  opt_run cp "$file" "$bak"
+  if opt_run sed -i "${lineno}s/^/#/" "$file"; then
+    msg "$(c_grn "[✓] Исправлено: строка $lineno в $file закомментирована (бэкап: $bak)")"
+  else
+    msg "$(c_red "[!] Не удалось закомментировать строку $lineno в $file")"
+  fi
+}
+
+# разбор строк E:/W: из лога apt update и применение фиксов по известным шаблонам
+fau_apply_fixes(){
+  local log="$1" auto="$2" line
+  while IFS= read -r line; do
+    case "$line" in
+      *"does not have a Release file"*)
+        fau_fix_release_file "$line" ;;
+      *NO_PUBKEY*)
+        fau_fix_no_pubkey "$line" "$auto" ;;
+      *"Malformed entry"*)
+        fau_fix_malformed "$line" ;;
+      *"Could not resolve"*|*"Temporary failure resolving"*|*"Could not connect"*|*"Connection timed out"*)
+        msg "$(c_yel "[i] Похоже на сетевую проблему (DNS/сеть): $line")"
+        msg "$(c_yel '    Автофикс не применяется — проверь сеть/DNS вручную.')"
+        ;;
+      *)
+        msg "$(c_red '[?] Неизвестная ошибка, автофикс не применён, требуется ручная проверка:')"
+        msg "$(c_red "    $line")"
+        ;;
+    esac
+  done < <(grep -E '^(E:|W:)' "$log" | sort -u)
+}
+
+# главная функция: диагностика apt update, автофикс известных ошибок, затем upgrade
+fix_and_update(){
+  local auto=false a
+  for a in "$@"; do [[ "$a" == "--auto" ]] && auto=true; done
+
+  msg "$(c_cyn '─── Фикс и обновление ───')"
+
+  local log1 log2
+  log1="$(mktemp)"; log2="$(mktemp)"
+
+  msg "$(c_cyn '[*] Проверяю apt update (диагностика, без сырого вывода)...')"
+  opt_run apt-get update >"$log1" 2>&1
+
+  if ! grep -qE '^(E:|W:)' "$log1"; then
+    msg "$(c_grn '[✓] apt update прошёл без ошибок.')"
+    rm -f "$log1" "$log2"
+  else
+    msg "$(c_yel '[!] Обнаружены проблемы apt update — разбираю и применяю известные фиксы...')"
+    fau_apply_fixes "$log1" "$auto"
+    rm -f "$log1"
+
+    msg ""
+    msg "$(c_cyn '[*] Повторная проверка apt update...')"
+    opt_run apt-get update >"$log2" 2>&1
+
+    if grep -qE '^(E:|W:)' "$log2"; then
+      msg "$(c_red '[!] После фиксов остались ошибки apt update:')"
+      grep -E '^(E:|W:)' "$log2" | while IFS= read -r line; do
+        msg "$(c_red "    $line")"
+      done
+      msg "$(c_red '[!] apt upgrade не запущен — исправь ошибки вручную и повтори.')"
+      rm -f "$log2"
+      return 1
+    fi
+    rm -f "$log2"
+    msg "$(c_grn '[✓] После фиксов apt update чист.')"
+  fi
+
+  msg ""
+  msg "$(c_cyn '[*] Запускаю apt upgrade -y...')"
+  if opt_run apt-get upgrade -y; then
+    msg "$(c_grn '[✓] Система обновлена.')"
+  else
+    msg "$(c_red '[!] Ошибка при apt upgrade.')"
+    return 1
   fi
 }
 
