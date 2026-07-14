@@ -9,6 +9,8 @@
 #   4. Оптимизация (память, docker-лимиты, логи).
 #   5. Обновление системы + фикс при сбоях (диагностика apt update,
 #      автофикс известных ошибок при необходимости, затем apt upgrade -y).
+#   6. Обновление / откат ноды Remnawave (выбор версии с GitHub, без потери
+#      настроек docker-compose).
 #
 # Запуск:
 #   bash <(curl -fsSL .../warp-rules.sh)        # покажет меню
@@ -17,6 +19,7 @@
 #   bash warp-rules.sh 3                          # сразу режим 3
 #   bash warp-rules.sh 5                          # сразу режим 5
 #   bash warp-rules.sh 5 --auto                   # режим 5 без интерактивных вопросов (cron)
+#   bash warp-rules.sh 6                          # сразу режим 6
 #   bash warp-rules.sh 1 -- -t 5                  # аргументы после -- уходят в ipregion
 
 set -uo pipefail
@@ -56,6 +59,17 @@ c_cyn(){ printf '\033[1;36m%s\033[0m' "$1"; }
 msg(){ printf '%s\n' "$*" >&2; }
 need(){ command -v "$1" >/dev/null 2>&1; }
 in_list(){ local x="$1"; shift; local i; for i in "$@"; do [[ "$i" == "$x" ]] && return 0; done; return 1; }
+
+# текущая версия ноды remnanode + xray, напр. "2.7.0 (xray 1.8.4)". Пусто, если ноды нет.
+remnanode_status(){
+  need docker || return 1
+  local img tag xver
+  img=$(docker inspect remnanode --format '{{.Config.Image}}' 2>/dev/null) || return 1
+  [[ -z "$img" ]] && return 1
+  tag="${img##*:}"
+  xver=$(docker exec remnanode xray version 2>/dev/null | awk 'NR==1{print $2}')
+  printf '%s%s' "$tag" "${xver:+ (xray $xver)}"
+}
 
 # спиннер: крутится, пока жив процесс $1, рядом текст $2
 spinner(){
@@ -593,11 +607,14 @@ show_hints(){
 show_menu(){
   msg ""
   msg "$(c_cyn '═══════════  warp-rules  ═══════════')"
+  local rn_status; rn_status=$(remnanode_status 2>/dev/null)
+  [[ -n "$rn_status" ]] && msg "  $(c_yel 'Нода Remnawave:') $(c_grn "$rn_status")"
   msg "  1. Анализ сервера + блок для конфига"
   msg "  2. Проверка пригодности WARP (до установки)"
   msg "  3. Установка инструментов (Remnawave / TrafficGuard / Решала / Multitest)"
   msg "  4. Оптимизация (память, docker-лимиты, логи)"
   msg "  5. Обновление системы + фикс при сбоях"
+  msg "  6. Обновление / откат ноды Remnawave"
   msg "  0. Выход"
   msg "$(c_cyn '════════════════════════════════════')"
 }
@@ -619,18 +636,20 @@ main(){
     if $auto_flag; then fix_and_update --auto; else fix_and_update; fi
     return $?
   fi
+  if [[ "$choice" == "6" ]]; then mode_remnanode_update; return $?; fi
 
   # иначе показать меню и читать выбор с терминала
   while :; do
     show_menu
-    printf '%s' "$(c_yel '[?] Выбор (0-5): ')" >&2
-    read -r choice < /dev/tty 2>/dev/null || { msg ""; msg "Нет терминала. Запусти: bash warp-rules.sh 1  (или 2, 3, 4, 5)"; return 1; }
+    printf '%s' "$(c_yel '[?] Выбор (0-6): ')" >&2
+    read -r choice < /dev/tty 2>/dev/null || { msg ""; msg "Нет терминала. Запусти: bash warp-rules.sh 1  (или 2, 3, 4, 5, 6)"; return 1; }
     case "$choice" in
       1) mode_analyze; return $? ;;
       2) mode_test_warp; return $? ;;
       3) mode_install_tools ;;
       4) mode_optimization ;;
       5) fix_and_update ;;
+      6) mode_remnanode_update ;;
       0) show_hints; update_motd; msg "Выход."; return 0 ;;
       *) msg "$(c_red 'Неверный выбор, повтори.')" ;;
     esac
@@ -1083,6 +1102,115 @@ mode_optimization(){
       *) msg "$(c_red 'Неверный выбор, повтори.')" ;;
     esac
   done
+}
+
+# =========================== МОДУЛЬ: ОБНОВЛЕНИЕ/ОТКАТ НОДЫ REMNAWAVE =======
+
+# последние 3 тега релизов remnawave/node с GitHub, по одному в строке
+rn_github_releases(){
+  local json
+  json=$(curl -fsSL --max-time 10 "https://api.github.com/repos/remnawave/node/releases?per_page=3" 2>/dev/null) || return 1
+  if need jq; then
+    printf '%s' "$json" | jq -r '.[].tag_name' 2>/dev/null
+  else
+    printf '%s' "$json" | grep -o '"tag_name": *"[^"]*"' | sed -E 's/.*"([^"]+)"$/\1/'
+  fi
+}
+
+mode_remnanode_update(){
+  if ! docker inspect remnanode >/dev/null 2>&1; then
+    msg "$(c_red '[!] Нода remnanode не найдена.')"
+    msg "$(c_yel '[i] Сначала установи её через пункт 3 меню.')"
+    return 1
+  fi
+
+  msg "$(c_cyn '─── Обновление / откат ноды Remnawave ───')"
+  msg "  Текущая версия: $(c_grn "$(remnanode_status)")"
+  msg ""
+
+  local -a vers=()
+  local v
+  while IFS= read -r v; do [[ -n "$v" ]] && vers+=("${v#v}"); done < <(rn_github_releases)
+  [[ ${#vers[@]} -eq 0 ]] && msg "$(c_yel '[!] Не удалось получить список релизов с GitHub (сеть/лимит API).')"
+
+  local i=1
+  for v in "${vers[@]}"; do msg "  $i. $v"; i=$((i+1)); done
+  local manual_idx=$i
+  msg "  $manual_idx. Ввести версию вручную"
+  msg "  0. Отмена"
+  msg ""
+  printf '%s' "$(c_yel "[?] Выбор (0-$manual_idx): ")" >&2
+  local choice; read -r choice < /dev/tty 2>/dev/null || return 1
+  [[ "$choice" == "0" ]] && return 0
+
+  local target
+  if [[ "$choice" == "$manual_idx" ]]; then
+    printf '%s' "$(c_yel '[?] Версия (например 2.7.0): ')" >&2
+    read -r target < /dev/tty 2>/dev/null
+    target="${target#v}"
+  elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice < manual_idx )); then
+    target="${vers[$((choice-1))]}"
+  else
+    msg "$(c_red 'Неверный выбор.')"
+    return 1
+  fi
+  [[ -z "$target" ]] && { msg "$(c_red 'Версия не указана.')"; return 1; }
+
+  local dir
+  dir=$(docker inspect remnanode --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null)
+  if [[ -z "$dir" || ! -d "$dir" ]]; then
+    msg "$(c_red '[!] Не нашёл рабочую директорию docker-compose ноды.')"
+    return 1
+  fi
+  local cf
+  cf=$(find "$dir" -maxdepth 1 -name 'docker-compose.y*ml' 2>/dev/null | head -n1)
+  if [[ -z "$cf" ]]; then
+    msg "$(c_red "[!] docker-compose.yml не найден в $dir")"
+    return 1
+  fi
+
+  local bak="${cf}.bak.$(date +%Y%m%d_%H%M%S)"
+  opt_run cp "$cf" "$bak"
+
+  # правим только тег образа, остальной файл (env/volumes/порты) не трогаем
+  if ! opt_run sed -i -E "s|(remnawave/node):[^[:space:]]+|\1:${target}|" "$cf" \
+     || ! grep -q "remnawave/node:${target}" "$cf"; then
+    msg "$(c_red '[!] Не удалось изменить docker-compose.yml — откатываю.')"
+    opt_run cp "$bak" "$cf"
+    return 1
+  fi
+
+  if need docker && ! (cd "$dir" && docker compose config --quiet >/dev/null 2>&1); then
+    msg "$(c_red '[!] Конфиг стал невалиден — откатываю.')"
+    opt_run cp "$bak" "$cf"
+    return 1
+  fi
+
+  msg "$(c_cyn "[*] Скачиваю remnawave/node:${target}...")"
+  local out
+  if ! out=$(cd "$dir" && opt_run docker compose pull remnanode 2>&1); then
+    msg "$(c_red '[!] Ошибка загрузки образа — откатываю.')"
+    msg "$out"
+    opt_run cp "$bak" "$cf"
+    return 1
+  fi
+
+  if ! out=$(cd "$dir" && opt_run docker compose up -d remnanode 2>&1); then
+    msg "$(c_red '[!] Ошибка запуска — откатываю и поднимаю прежнюю версию.')"
+    msg "$out"
+    opt_run cp "$bak" "$cf"
+    (cd "$dir" && opt_run docker compose up -d remnanode >/dev/null 2>&1)
+    return 1
+  fi
+
+  spin_sleep 5 "Проверяю ноду..."
+  local new_status; new_status=$(remnanode_status)
+  if [[ "$new_status" == "$target"* ]]; then
+    msg "$(c_grn "[✓] Установлено: remnanode $new_status")"
+  else
+    msg "$(c_yel "[!] Нода запущена, но версия отличается от ожидаемой: ${new_status:-нет данных}")"
+    msg "$(c_yel "    Бэкап прежнего файла: $bak")"
+  fi
 }
 
 main "$@"
