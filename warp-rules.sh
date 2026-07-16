@@ -11,6 +11,8 @@
 #      автофикс известных ошибок при необходимости, затем apt upgrade -y).
 #   6. Обновление / откат ноды Remnawave (выбор версии с GitHub, без потери
 #      настроек docker-compose).
+#   7. Обновление / откат Xray-Core без обновления ноды (меняет только
+#      бинарник xray внутри контейнера ноды, образ Node не трогает).
 #
 # Запуск:
 #   bash <(curl -fsSL .../warp-rules.sh)        # покажет меню
@@ -20,6 +22,7 @@
 #   bash warp-rules.sh 5                          # сразу режим 5
 #   bash warp-rules.sh 5 --auto                   # режим 5 без интерактивных вопросов (cron)
 #   bash warp-rules.sh 6                          # сразу режим 6
+#   bash warp-rules.sh 7                          # сразу режим 7
 #   bash warp-rules.sh 1 -- -t 5                  # аргументы после -- уходят в ipregion
 
 set -uo pipefail
@@ -615,6 +618,7 @@ show_menu(){
   msg "  4. Оптимизация (память, docker-лимиты, логи)"
   msg "  5. Обновление системы + фикс при сбоях"
   msg "  6. Обновление / откат ноды Remnawave"
+  msg "  7. Обновление / откат Xray-Core (без обновления ноды)"
   msg "  0. Выход"
   msg "$(c_cyn '════════════════════════════════════')"
 }
@@ -637,12 +641,13 @@ main(){
     return $?
   fi
   if [[ "$choice" == "6" ]]; then mode_remnanode_update; return $?; fi
+  if [[ "$choice" == "7" ]]; then mode_xray_update; return $?; fi
 
   # иначе показать меню и читать выбор с терминала
   while :; do
     show_menu
-    printf '%s' "$(c_yel '[?] Выбор (0-6): ')" >&2
-    read -r choice < /dev/tty 2>/dev/null || { msg ""; msg "Нет терминала. Запусти: bash warp-rules.sh 1  (или 2, 3, 4, 5, 6)"; return 1; }
+    printf '%s' "$(c_yel '[?] Выбор (0-7): ')" >&2
+    read -r choice < /dev/tty 2>/dev/null || { msg ""; msg "Нет терминала. Запусти: bash warp-rules.sh 1  (или 2, 3, 4, 5, 6, 7)"; return 1; }
     case "$choice" in
       1) mode_analyze; return $? ;;
       2) mode_test_warp; return $? ;;
@@ -650,6 +655,7 @@ main(){
       4) mode_optimization ;;
       5) fix_and_update ;;
       6) mode_remnanode_update ;;
+      7) mode_xray_update ;;
       0) show_hints; update_motd; msg "Выход."; return 0 ;;
       *) msg "$(c_red 'Неверный выбор, повтори.')" ;;
     esac
@@ -1211,6 +1217,300 @@ mode_remnanode_update(){
     msg "$(c_yel "[!] Нода запущена, но версия отличается от ожидаемой: ${new_status:-нет данных}")"
     msg "$(c_yel "    Бэкап прежнего файла: $bak")"
   fi
+}
+
+# =========================== МОДУЛЬ: ОБНОВЛЕНИЕ/ОТКАТ XRAY-CORE ============
+# Меняет только бинарник xray внутри контейнера ноды, образ/версию самой
+# Node не трогает. Независим от режима 6.
+
+XC_NODE_MIN_COMPAT="2.8.0"     # начиная с этой версии Node...
+XC_CORE_MIN_COMPAT="26.6.27"   # ...требуется минимум эта версия Xray-Core
+
+# истина, если версия $1 >= $2 (сравнение через sort -V)
+xc_ver_ge(){
+  local a="$1" b="$2"
+  [[ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | tail -n1)" == "$a" ]]
+}
+
+# контейнер ноды — тот же, что использует пункт 6
+xc_container(){
+  docker inspect remnanode >/dev/null 2>&1 && { printf 'remnanode'; return 0; }
+  return 1
+}
+
+xc_cur_version(){ docker exec "$1" xray version 2>/dev/null | awk 'NR==1{print $2}'; }
+
+xc_node_tag(){
+  local img
+  img=$(docker inspect "$1" --format '{{.Config.Image}}' 2>/dev/null) || return 1
+  printf '%s' "${img##*:}"
+}
+
+xc_arch(){ docker exec "$1" uname -m 2>/dev/null; }
+
+# список тегов релизов Xray-Core (по умолчанию без пре-релизов)
+xc_releases(){
+  local include_pre="$1" limit="$2" json
+  json=$(curl -fsSL --max-time 10 "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=30" 2>/dev/null) || return 1
+  need jq || { printf '%s' "$json" | grep -o '"tag_name": *"[^"]*"' | sed -E 's/.*"([^"]+)"$/\1/' | head -n "$limit"; return 0; }
+  if [[ "$include_pre" == "true" ]]; then
+    printf '%s' "$json" | jq -r '.[].tag_name' 2>/dev/null | head -n "$limit"
+  else
+    printf '%s' "$json" | jq -r '.[] | select(.prerelease==false) | .tag_name' 2>/dev/null | head -n "$limit"
+  fi
+}
+
+# имя asset-файла под архитектуру внутри контейнера
+xc_asset_name(){
+  case "$1" in
+    x86_64|amd64)   printf 'Xray-linux-64.zip' ;;
+    aarch64|arm64)  printf 'Xray-linux-arm64-v8a.zip' ;;
+    armv7l|armhf)   printf 'Xray-linux-arm32-v7a.zip' ;;
+    i386|i686)      printf 'Xray-linux-32.zip' ;;
+    *) return 1 ;;
+  esac
+}
+
+# прямая ссылка на asset релиза $1 (тег, с "v") под архитектуру $2
+xc_asset_url(){
+  local tag="$1" arch="$2" asset json url
+  asset=$(xc_asset_name "$arch") || return 1
+  json=$(curl -fsSL --max-time 10 "https://api.github.com/repos/XTLS/Xray-core/releases/tags/${tag}" 2>/dev/null) || return 1
+  if need jq; then
+    url=$(printf '%s' "$json" | jq -r --arg n "$asset" '.assets[] | select(.name==$n) | .browser_download_url' 2>/dev/null)
+  else
+    url=$(printf '%s' "$json" | grep -o "\"browser_download_url\": *\"[^\"]*${asset}\"" | sed -E 's/.*"([^"]+)"$/\1/')
+  fi
+  [[ -z "$url" ]] && return 1
+  printf '%s' "$url"
+}
+
+# список бэкапов бинарника внутри контейнера (полные пути)
+xc_backups(){ docker exec "$1" sh -c 'ls -1 /usr/local/bin/xray.bak-* 2>/dev/null'; }
+
+# восстановить конкретный бэкап и перезапустить контейнер
+xc_restore(){
+  local c="$1" bak="$2"
+  msg "$(c_cyn "[*] Восстанавливаю $bak...")"
+  if ! docker exec "$c" cp "$bak" /usr/local/bin/xray 2>/dev/null; then
+    msg "$(c_red '[!] Не удалось восстановить бэкап.')"
+    return 1
+  fi
+  opt_run docker restart "$c" >/dev/null 2>&1
+  spin_sleep 4 "Перезапускаю контейнер..."
+  local v; v=$(xc_cur_version "$c")
+  if [[ -n "$v" ]]; then
+    msg "$(c_grn "[✓] Xray-Core восстановлен: $v")"
+    return 0
+  fi
+  msg "$(c_red '[!] После восстановления версия не определяется.')"
+  return 1
+}
+
+# подменю: показать бэкапы внутри контейнера, дать откатиться на любой
+xc_backups_menu(){
+  local c="$1"
+  local -a baks=()
+  local b
+  while IFS= read -r b; do [[ -n "$b" ]] && baks+=("$b"); done < <(xc_backups "$c")
+
+  if [[ ${#baks[@]} -eq 0 ]]; then
+    msg "$(c_yel '[!] Бэкапов Xray-Core внутри контейнера не найдено.')"
+    return 0
+  fi
+
+  msg ""
+  msg "$(c_cyn '─── Бэкапы Xray-Core в контейнере ───')"
+  local i=1
+  for b in "${baks[@]}"; do msg "  $i. ${b##*/}"; i=$((i+1)); done
+  msg "  0. Назад"
+  msg "$(c_cyn '──────────────────────────────────────')"
+  printf '%s' "$(c_yel "[?] Выбор (0-$((i-1))): ")" >&2
+  local choice; read -r choice < /dev/tty 2>/dev/null || return 1
+  [[ "$choice" == "0" ]] && return 0
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#baks[@]} )); then
+    msg "$(c_red 'Неверный выбор.')"
+    return 1
+  fi
+  xc_restore "$c" "${baks[$((choice-1))]}"
+}
+
+# выбор версии Xray-Core с GitHub, скачивание, бэкап, установка, проверка
+xc_pick_and_install(){
+  local c="$1" node_tag="$2" arch="$3"
+  local include_pre=false tag=""
+
+  while :; do
+    msg ""
+    msg "$(c_cyn '[*] Получаю список релизов Xray-Core с GitHub...')"
+    local -a vers=()
+    local v
+    while IFS= read -r v; do [[ -n "$v" ]] && vers+=("$v"); done < <(xc_releases "$include_pre" 8)
+    [[ ${#vers[@]} -eq 0 ]] && msg "$(c_yel '[!] Не удалось получить список релизов с GitHub (сеть/лимит API).')"
+
+    msg ""
+    local i=1
+    for v in "${vers[@]}"; do msg "  $i. $v"; i=$((i+1)); done
+    local manual_idx=$i
+    msg "  $manual_idx. Ввести версию вручную"
+    local toggle_idx=$((manual_idx + 1))
+    if $include_pre; then
+      msg "  $toggle_idx. Скрыть пре-релизы"
+    else
+      msg "  $toggle_idx. Показать все версии (включая пре-релизы)"
+    fi
+    msg "  0. Отмена"
+    msg ""
+    printf '%s' "$(c_yel "[?] Выбор (0-$toggle_idx): ")" >&2
+    local choice; read -r choice < /dev/tty 2>/dev/null || return 1
+
+    [[ "$choice" == "0" ]] && return 0
+    if [[ "$choice" == "$toggle_idx" ]]; then
+      if $include_pre; then include_pre=false; else include_pre=true; fi
+      continue
+    fi
+    if [[ "$choice" == "$manual_idx" ]]; then
+      printf '%s' "$(c_yel '[?] Версия (например v26.6.27 или 26.6.27): ')" >&2
+      read -r tag < /dev/tty 2>/dev/null
+      [[ -z "$tag" ]] && { msg "$(c_red 'Версия не указана.')"; return 1; }
+      [[ "$tag" != v* ]] && tag="v${tag}"
+      break
+    fi
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice < manual_idx )); then
+      tag="${vers[$((choice-1))]}"
+      break
+    fi
+    msg "$(c_red 'Неверный выбор, повтори.')"
+  done
+
+  local target_ver="${tag#v}"
+
+  # проверка совместимости Node >= 2.8.0 <-> Xray-Core >= 26.6.27
+  if [[ -n "$node_tag" ]] && xc_ver_ge "$node_tag" "$XC_NODE_MIN_COMPAT" \
+     && ! xc_ver_ge "$target_ver" "$XC_CORE_MIN_COMPAT"; then
+    msg ""
+    msg "$(c_red '======================================================')"
+    msg "$(c_red "[!] Node $node_tag требует Xray-Core >= $XC_CORE_MIN_COMPAT.")"
+    msg "$(c_red "    Выбранная версия $target_ver — старше и может быть несовместима.")"
+    msg "$(c_red '    Нода может не запуститься или работать нестабильно.')"
+    msg "$(c_red '======================================================')"
+    printf '%s' "$(c_yel '[?] Введите "да, я понимаю риск" чтобы продолжить: ')" >&2
+    local confirm; read -r confirm < /dev/tty 2>/dev/null
+    if [[ "$confirm" != "да, я понимаю риск" ]]; then
+      msg "$(c_yel '[i] Отменено — версия Xray-Core не изменена.')"
+      return 0
+    fi
+  fi
+
+  local asset_url
+  asset_url=$(xc_asset_url "$tag" "$arch") || {
+    msg "$(c_red "[!] Не нашёл asset под архитектуру ($arch) в релизе $tag.")"
+    return 1
+  }
+
+  if ! need unzip; then
+    msg "$(c_yel '[*] Устанавливаю unzip...')"
+    opt_run apt-get install -y unzip -qq >/dev/null 2>&1
+    need unzip || { msg "$(c_red '[!] unzip недоступен и не установился — установи вручную.')"; return 1; }
+  fi
+
+  local tmpd; tmpd=$(mktemp -d)
+  msg "$(c_cyn "[*] Скачиваю ${asset_url##*/} ($tag)...")"
+  if ! curl -fsSL --max-time 90 "$asset_url" -o "$tmpd/xray.zip"; then
+    msg "$(c_red '[!] Ошибка загрузки архива.')"
+    rm -rf "$tmpd"; return 1
+  fi
+
+  unzip -o -q "$tmpd/xray.zip" -d "$tmpd/extracted" >/dev/null 2>&1
+  local bin="$tmpd/extracted/xray"
+  if [[ ! -f "$bin" ]]; then
+    msg "$(c_red '[!] В архиве не найден бинарник xray.')"
+    rm -rf "$tmpd"; return 1
+  fi
+  chmod +x "$bin"
+
+  local cur_ver; cur_ver=$(xc_cur_version "$c")
+  local bak="/usr/local/bin/xray.bak-${cur_ver:-unknown}"
+  if docker exec "$c" test -f "$bak" 2>/dev/null; then
+    msg "$(c_yel "[!] Бэкап $bak уже существует — не перезаписываю.")"
+  else
+    if docker exec "$c" cp /usr/local/bin/xray "$bak" 2>/dev/null; then
+      msg "$(c_grn "[✓] Бэкап текущей версии создан: $bak")"
+    else
+      msg "$(c_red '[!] Не удалось создать бэкап — прерываю, чтобы не потерять путь отката.')"
+      rm -rf "$tmpd"; return 1
+    fi
+  fi
+
+  msg "$(c_cyn "[*] Устанавливаю Xray-Core $target_ver в контейнер...")"
+  if ! docker cp "$bin" "$c":/usr/local/bin/xray; then
+    msg "$(c_red '[!] docker cp не удался.')"
+    rm -rf "$tmpd"; return 1
+  fi
+  rm -rf "$tmpd"
+
+  opt_run docker restart "$c" >/dev/null 2>&1
+  spin_sleep 4 "Перезапускаю контейнер..."
+
+  local new_ver logs_ok=true
+  new_ver=$(xc_cur_version "$c")
+  docker logs --tail 30 "$c" 2>&1 | grep -qi 'fatal' && logs_ok=false
+
+  if [[ "$new_ver" == "$target_ver" ]] && $logs_ok; then
+    msg "$(c_grn "[✓] Xray-Core обновлён: $new_ver")"
+  else
+    msg "$(c_yel "[!] Проблема после обновления (версия: ${new_ver:-нет данных}, ожидалась $target_ver).")"
+    printf '%s' "$(c_yel "[?] Обнаружена проблема. Откатить на предыдущую версию ($bak)? (y/n): ")" >&2
+    local ans; read -r ans < /dev/tty 2>/dev/null
+    if [[ "$ans" =~ ^[yYдД]$ ]]; then
+      xc_restore "$c" "$bak"
+    else
+      msg "$(c_yel "[i] Откат не выполнен. Бэкап остаётся: $bak")"
+    fi
+  fi
+
+  msg ""
+  msg "$(c_red '[!] Внимание: при следующем обновлении/пересоздании образа Node')"
+  msg "$(c_red '    (пункт 6 этого меню или docker pull) версия Xray-Core будет')"
+  msg "$(c_red '    перезаписана той, что зашита в новый образ Node. Если хочешь')"
+  msg "$(c_red '    сохранить текущую версию Xray после обновления Node — повтори')"
+  msg "$(c_red '    обновление Xray заново после пункта 6.')"
+}
+
+mode_xray_update(){
+  local c
+  c=$(xc_container) || {
+    msg "$(c_red '[!] Нода remnanode не найдена.')"
+    msg "$(c_yel '[i] Сначала установи её через пункт 3 меню.')"
+    return 1
+  }
+
+  while :; do
+    local cur_xray cur_img arch
+    cur_xray=$(xc_cur_version "$c")
+    cur_img=$(xc_node_tag "$c")
+    arch=$(xc_arch "$c")
+
+    msg ""
+    msg "$(c_cyn '─── Обновление / откат Xray-Core (без обновления ноды) ───')"
+    msg "  Контейнер:          $(c_grn "$c")"
+    msg "  Версия Xray-Core:   $(c_grn "${cur_xray:-неизвестно}")"
+    msg "  Версия образа Node: $(c_grn "${cur_img:-неизвестно}")"
+    msg "  Архитектура:        $(c_grn "${arch:-неизвестно}")"
+    msg ""
+    msg "  1. Выбрать версию Xray-Core (обновить/откатить)"
+    msg "  2. Показать список бэкапов и откатиться"
+    msg "  0. Отмена"
+    msg "$(c_cyn '─────────────────────────────────────────────────────────')"
+    printf '%s' "$(c_yel '[?] Выбор (0-2): ')" >&2
+    local choice; read -r choice < /dev/tty 2>/dev/null || return 1
+    case "$choice" in
+      1) xc_pick_and_install "$c" "$cur_img" "$arch"; return $? ;;
+      2) xc_backups_menu "$c" ;;
+      0) return 0 ;;
+      *) msg "$(c_red 'Неверный выбор, повтори.')" ;;
+    esac
+  done
 }
 
 main "$@"
