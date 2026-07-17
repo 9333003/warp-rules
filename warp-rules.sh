@@ -830,13 +830,25 @@ setup_bbr_cake(){
     qdisc="fq"; qmod="sch_fq"
   fi
 
-  # --- 1. персистентность через ребут ---
-  printf 'net.core.default_qdisc = %s\nnet.ipv4.tcp_congestion_control = bbr\n' "$qdisc" \
+  # --- 1. персистентность через ребут (BBR/CAKE + TCP-буферы для высокого RTT) ---
+  printf '%s\n' \
+    "net.core.default_qdisc = $qdisc" \
+    "net.ipv4.tcp_congestion_control = bbr" \
+    "net.core.rmem_max = 16777216" \
+    "net.core.wmem_max = 16777216" \
+    "net.ipv4.tcp_rmem = 4096 87380 16777216" \
+    "net.ipv4.tcp_wmem = 4096 65536 16777216" \
+    "net.ipv4.tcp_fastopen = 3" \
     | opt_run tee /etc/sysctl.d/99-zz-bbr-cake.conf >/dev/null
   msg "$(c_grn '[✓] Записан /etc/sysctl.d/99-zz-bbr-cake.conf (применяется последним по алфавиту).')"
 
   printf 'tcp_bbr\n%s\n' "$qmod" | opt_run tee /etc/modules-load.d/bbr-cake.conf >/dev/null
   msg "$(c_grn '[✓] Автозагрузка модулей: /etc/modules-load.d/bbr-cake.conf.')"
+
+  if [[ -f /etc/sysctl.d/99-reshala-boost.conf ]]; then
+    opt_run rm -f /etc/sysctl.d/99-reshala-boost.conf
+    msg "$(c_grn '[✓] Старый конфиг 99-reshala-boost.conf удалён (настройки перенесены).')"
+  fi
 
   # --- 2. устранение конфликтов ---
   if [[ -f /etc/sysctl.conf ]]; then
