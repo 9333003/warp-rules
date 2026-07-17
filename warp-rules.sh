@@ -738,6 +738,88 @@ opt_hybrid_memory(){
 }
 
 # ----------------------------------------------------------------------------
+# 1b. TCP ФОРСАЖ: BBR (congestion control) + CAKE (qdisc)
+# ----------------------------------------------------------------------------
+setup_bbr_cake(){
+  msg ""
+  msg "$(c_cyn '─── TCP форсаж: BBR + CAKE ───')"
+
+  local has_bbr=1 has_cake=1
+  modinfo tcp_bbr  >/dev/null 2>&1 || has_bbr=0
+  modinfo sch_cake >/dev/null 2>&1 || has_cake=0
+
+  if [[ "$has_bbr" -eq 0 ]]; then
+    msg "$(c_red '[!] tcp_bbr недоступен в этом ядре — BBR не может быть включён. Пропускаю.')"
+    return 1
+  fi
+
+  local qdisc="cake" qmod="sch_cake"
+  if [[ "$has_cake" -eq 0 ]]; then
+    msg "$(c_yel '[!] sch_cake недоступен (нужен Linux >= 4.19) — использую fq вместо cake.')"
+    qdisc="fq"; qmod="sch_fq"
+  fi
+
+  # --- 1. персистентность через ребут ---
+  printf 'net.core.default_qdisc = %s\nnet.ipv4.tcp_congestion_control = bbr\n' "$qdisc" \
+    | opt_run tee /etc/sysctl.d/99-zz-bbr-cake.conf >/dev/null
+  msg "$(c_grn '[✓] Записан /etc/sysctl.d/99-zz-bbr-cake.conf (применяется последним по алфавиту).')"
+
+  printf 'tcp_bbr\n%s\n' "$qmod" | opt_run tee /etc/modules-load.d/bbr-cake.conf >/dev/null
+  msg "$(c_grn '[✓] Автозагрузка модулей: /etc/modules-load.d/bbr-cake.conf.')"
+
+  # --- 2. устранение конфликтов ---
+  if [[ -f /etc/sysctl.conf ]]; then
+    opt_run sed -i -E \
+      -e 's/^([[:space:]]*)(net\.core\.default_qdisc[[:space:]]*=.*)/# \2/' \
+      -e 's/^([[:space:]]*)(net\.ipv4\.tcp_congestion_control[[:space:]]*=.*)/# \2/' \
+      /etc/sysctl.conf 2>/dev/null
+    msg "$(c_grn '[✓] Конфликтующие строки в /etc/sysctl.conf закомментированы (если были).')"
+  fi
+
+  local conflict
+  conflict=$(grep -lE '^[[:space:]]*(net\.core\.default_qdisc|net\.ipv4\.tcp_congestion_control)[[:space:]]*=' /etc/sysctl.d/*.conf 2>/dev/null | grep -v '99-zz-bbr-cake.conf')
+  if [[ -n "$conflict" ]]; then
+    msg "$(c_yel '[!] Найдены конфликтующие настройки в других файлах sysctl.d:')"
+    while IFS= read -r f; do msg "$(c_yel "      - $f")"; done <<< "$conflict"
+    msg "$(c_yel '    Проверь их вручную — приоритет применения зависит от алфавитного порядка имён.')"
+  fi
+
+  # --- 3. применение без ребута ---
+  msg "$(c_yel '[*] Загружаю модули ядра...')"
+  opt_run modprobe tcp_bbr 2>/dev/null
+  opt_run modprobe "$qmod" 2>/dev/null
+
+  msg "$(c_yel '[*] Применяю sysctl --system...')"
+  if ! opt_run sysctl --system >/dev/null 2>&1; then
+    msg "$(c_red '[!] sysctl недоступен на запись (OpenVZ/LXC?) — настройки сохранены в файлах, но не применены к текущему ядру.')"
+    return 1
+  fi
+  msg "$(c_grn '[✓] sysctl применён.')"
+
+  local iface
+  iface=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+  if [[ -z "$iface" ]]; then
+    msg "$(c_yel '[!] Не удалось определить интерфейс по умолчанию (ip route) — qdisc применится после ребута.')"
+  else
+    msg "$(c_yel "[*] Применяю qdisc $qdisc на интерфейсе $iface (tc qdisc replace)...")"
+    if opt_run tc qdisc replace dev "$iface" root "$qdisc" 2>/dev/null; then
+      msg "$(c_grn "[✓] $qdisc активен на $iface.")"
+    else
+      msg "$(c_yel "[!] tc qdisc replace не сработал на $iface (виртуальный интерфейс?) — применится после ребута.")"
+    fi
+  fi
+
+  # --- 4. контроль ---
+  msg ""
+  msg "$(c_cyn '[*] Контроль:')"
+  opt_run sysctl net.core.default_qdisc net.ipv4.tcp_congestion_control 2>/dev/null \
+    | while IFS= read -r l; do msg "  $l"; done
+  if [[ -n "$iface" ]]; then
+    tc qdisc show dev "$iface" 2>/dev/null | while IFS= read -r l; do msg "  $l"; done
+  fi
+}
+
+# ----------------------------------------------------------------------------
 # 2. ЛИМИТЫ RAM ДЛЯ remnanode (docker-compose)
 # ----------------------------------------------------------------------------
 opt_find_compose(){
@@ -1091,7 +1173,7 @@ mode_optimization(){
   while :; do
     msg ""
     msg "$(c_cyn '══════════  Оптимизация  ══════════')"
-    msg "  1. Гибридная память (ZRAM + Swap)"
+    msg "  1. Гибридная память + TCP форсаж (ZRAM + Swap + BBR + CAKE)"
     msg "  2. Лимиты RAM для remnanode (docker-compose)"
     msg "  3. Ротация логов journald"
     msg "  4. Применить всё сразу"
@@ -1100,10 +1182,10 @@ mode_optimization(){
     printf '%s' "$(c_yel '[?] Выбор (0-4): ')" >&2
     local choice; read -r choice < /dev/tty 2>/dev/null || return 1
     case "$choice" in
-      1) opt_hybrid_memory ;;
+      1) opt_hybrid_memory; setup_bbr_cake ;;
       2) opt_docker_limits ;;
       3) opt_log_rotation ;;
-      4) opt_hybrid_memory; opt_docker_limits; opt_log_rotation ;;
+      4) opt_hybrid_memory; setup_bbr_cake; opt_docker_limits; opt_log_rotation ;;
       0) return 0 ;;
       *) msg "$(c_red 'Неверный выбор, повтори.')" ;;
     esac
