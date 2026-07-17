@@ -915,6 +915,69 @@ setup_bbr_cake(){
 }
 
 # ----------------------------------------------------------------------------
+# 1c. СЕТЕВЫЕ ЛИМИТЫ (tier по RAM): conntrack, somaxconn, backlog, file-max
+# ----------------------------------------------------------------------------
+opt_node_limits(){
+  msg ""
+  msg "$(c_cyn '─── Сетевые лимиты (tier по RAM) ───')"
+
+  local ram_mb
+  ram_mb=$(( $(grep MemTotal /proc/meminfo | awk '{print $2}') / 1024 ))
+
+  local tier conntrack_max somaxconn
+  if   [ "$ram_mb" -lt 2048 ]; then tier=1; conntrack_max=131072;  somaxconn=8192
+  elif [ "$ram_mb" -lt 4096 ]; then tier=2; conntrack_max=262144;  somaxconn=16384
+  elif [ "$ram_mb" -lt 8192 ]; then tier=3; conntrack_max=524288;  somaxconn=32768
+  else                              tier=4; conntrack_max=1048576; somaxconn=65535
+  fi
+
+  msg "$(c_cyn "[i] RAM: ${ram_mb} MB → tier ${tier} (conntrack ${conntrack_max}, somaxconn ${somaxconn})")"
+
+  local -a lines=(
+    "net.core.somaxconn = ${somaxconn}"
+    "net.ipv4.tcp_max_syn_backlog = ${somaxconn}"
+    "net.core.netdev_max_backlog = 16384"
+    "net.core.netdev_budget = 600"
+    "net.ipv4.tcp_syncookies = 1"
+    "net.ipv4.conf.all.rp_filter = 2"
+    "net.ipv4.conf.default.rp_filter = 2"
+    "net.ipv4.tcp_ecn = 2"
+    "fs.file-max = 1048576"
+  )
+
+  local have_conntrack=0
+  if lsmod | grep -q nf_conntrack; then
+    have_conntrack=1
+    lines+=("net.netfilter.nf_conntrack_max = ${conntrack_max}")
+  else
+    msg "$(c_cyn '[i] conntrack не используется — лимит пропущен.')"
+  fi
+
+  printf '%s\n' "${lines[@]}" | opt_run tee /etc/sysctl.d/99-zz-node-limits.conf >/dev/null
+  msg "$(c_grn '[✓] Записан /etc/sysctl.d/99-zz-node-limits.conf.')"
+
+  printf '%s\n' \
+    "* soft nofile 1048576" \
+    "* hard nofile 1048576" \
+    | opt_run tee /etc/security/limits.d/99-node.conf >/dev/null
+  msg "$(c_grn '[✓] Записан /etc/security/limits.d/99-node.conf (nofile 1048576).')"
+
+  msg "$(c_yel '[*] Применяю sysctl --system...')"
+  if ! opt_run sysctl --system >/dev/null 2>&1; then
+    msg "$(c_yel '[!] sysctl недоступен на запись (OpenVZ/LXC?) — настройки сохранены в файлах, но не применены к текущему ядру.')"
+  else
+    msg "$(c_grn '[✓] sysctl применён.')"
+  fi
+
+  msg ""
+  msg "$(c_cyn '[*] Контроль:')"
+  local -a ctl_keys=(net.core.somaxconn)
+  [[ "$have_conntrack" -eq 1 ]] && ctl_keys+=(net.netfilter.nf_conntrack_max)
+  ctl_keys+=(fs.file-max)
+  opt_run sysctl "${ctl_keys[@]}" 2>/dev/null | while IFS= read -r l; do msg "  $l"; done
+}
+
+# ----------------------------------------------------------------------------
 # 2. ЛИМИТЫ RAM ДЛЯ remnanode (docker-compose)
 # ----------------------------------------------------------------------------
 opt_find_compose(){
@@ -1268,7 +1331,7 @@ mode_optimization(){
   while :; do
     msg ""
     msg "$(c_cyn '══════════  Оптимизация  ══════════')"
-    msg "  1. Гибридная память + TCP форсаж (ZRAM + Swap + BBR + CAKE)"
+    msg "  1. Полная оптимизация (ZRAM + Swap + BBR + CAKE + лимиты)"
     msg "  2. Лимиты RAM для remnanode (docker-compose)"
     msg "  3. Ротация логов journald"
     msg "  4. Применить всё сразу"
@@ -1277,10 +1340,10 @@ mode_optimization(){
     printf '%s' "$(c_yel '[?] Выбор (0-4): ')" >&2
     local choice; read -r choice < /dev/tty 2>/dev/null || return 1
     case "$choice" in
-      1) opt_hybrid_memory; setup_bbr_cake ;;
+      1) opt_hybrid_memory; setup_bbr_cake; opt_node_limits ;;
       2) opt_docker_limits ;;
       3) opt_log_rotation ;;
-      4) opt_hybrid_memory; setup_bbr_cake; opt_docker_limits; opt_log_rotation ;;
+      4) opt_hybrid_memory; setup_bbr_cake; opt_node_limits; opt_docker_limits; opt_log_rotation ;;
       0) return 0 ;;
       *) msg "$(c_red 'Неверный выбор, повтори.')" ;;
     esac
