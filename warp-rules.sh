@@ -688,12 +688,36 @@ opt_hybrid_memory(){
   msg "  RAM: $(c_grn "${ram_mb} MB")  →  ZRAM: $(c_grn "${zram_pct}%")  +  Swap: $(c_grn "${swap_mb} MB")"
   msg ""
 
-  # --- ZRAM (только если ядро поддерживает модуль) ---
-  local zram_ok=0
-  if ! modinfo zram >/dev/null 2>&1 && [ ! -e /sys/class/zram-control ]; then
-    msg "$(c_yel '[!] Модуль zram недоступен в этом ядре — ZRAM пропущен.')"
-    msg "$(c_yel '    Будет настроен только дисковый swap.')"
+  # --- ZRAM ---
+  local kernel_zram_ok=0 zram_ok=0 used_modules_extra=0
+  if opt_run modprobe zram 2>/dev/null || [ -e /sys/class/zram-control ]; then
+    kernel_zram_ok=1
   else
+    local virt
+    virt=$(systemd-detect-virt 2>/dev/null); [[ -z "$virt" ]] && virt="unknown"
+    case "$virt" in
+      openvz|lxc|lxc-libvirt)
+        msg "$(c_yel "[!] ZRAM недоступен: контейнер ($virt) работает на общем ядре хоста — модуль zram нельзя загрузить отдельно.")"
+        ;;
+      *)
+        msg "$(c_yel "[!] Модуль zram не найден в текущем ядре (виртуализация: $virt).")"
+        printf '%s' "$(c_yel "[?] Установить linux-modules-extra-$(uname -r)? (y/n): ")" >&2
+        local ans; read -r ans < /dev/tty 2>/dev/null
+        if [[ "$ans" =~ ^[yYдД]$ ]]; then
+          used_modules_extra=1
+          msg "$(c_yel "[*] Устанавливаю linux-modules-extra-$(uname -r)...")"
+          if opt_run apt-get install -y "linux-modules-extra-$(uname -r)" >/dev/null 2>&1 && opt_run modprobe zram 2>/dev/null; then
+            msg "$(c_grn '[✓] Модуль zram установлен и загружен.')"
+            kernel_zram_ok=1
+          else
+            msg "$(c_red '[!] Не удалось установить/загрузить zram.')"
+          fi
+        fi
+        ;;
+    esac
+  fi
+
+  if [[ "$kernel_zram_ok" -eq 1 ]]; then
     if ! dpkg -l zram-tools >/dev/null 2>&1; then
       msg "$(c_yel '[*] Устанавливаю zram-tools...')"
       opt_run apt-get install -y zram-tools >/dev/null 2>&1
@@ -706,30 +730,77 @@ opt_hybrid_memory(){
       msg "$(c_grn '[✓] ZRAM включён (zstd, приоритет 100).')"
       zram_ok=1
     else
-      msg "$(c_red '[!] ZRAM не поднялся (ядро без модуля zram?). Останется только swap.')"
+      msg "$(c_red '[!] ZRAM не поднялся после настройки. Останется только swap.')"
     fi
+  else
+    msg "$(c_yel '    Будет настроен только дисковый swap.')"
+  fi
+
+  if [[ "$zram_ok" -eq 1 && "$used_modules_extra" -eq 1 ]]; then
+    msg "$(c_cyn "[i] Пакет linux-modules-extra-$(uname -r) привязан к версии ядра. После apt upgrade модуль обычно подтянется сам; если ZRAM пропадёт — переустанови пакет.")"
   fi
 
   # --- Дисковый swap (страховка, низкий приоритет) ---
-  if swapon --show 2>/dev/null | grep -q '/swapfile'; then
-    msg "$(c_yel '[*] /swapfile уже есть — выставляю приоритет -2.')"
-    opt_run swapoff /swapfile 2>/dev/null || true
-    opt_run swapon -p -2 /swapfile 2>/dev/null || true
-  else
+  local -a disk_swaps=()
+  local ds_name ds_type
+  while read -r ds_name ds_type; do
+    [[ -z "$ds_name" ]] && continue
+    [[ "$ds_name" == /dev/zram* ]] && continue
+    disk_swaps+=("$ds_name")
+  done < <(swapon --show=NAME,TYPE --noheadings 2>/dev/null)
+
+  local swap_target
+  if [[ ${#disk_swaps[@]} -eq 0 ]]; then
     msg "$(c_yel "[*] Создаю /swapfile (${swap_mb} MB)...")"
     opt_run fallocate -l "${swap_mb}M" /swapfile 2>/dev/null \
       || opt_run dd if=/dev/zero of=/swapfile bs=1M count="${swap_mb}" status=none
     opt_run chmod 600 /swapfile
     opt_run mkswap /swapfile >/dev/null 2>&1
     opt_run swapon -p -2 /swapfile 2>/dev/null || opt_run swapon /swapfile
+    swap_target="/swapfile"
+  else
+    swap_target="${disk_swaps[0]}"
+    msg "$(c_yel "[*] Дисковый swap уже есть: $swap_target — выставляю приоритет -2.")"
+    opt_run swapoff "$swap_target" 2>/dev/null || true
+    opt_run swapon -p -2 "$swap_target" 2>/dev/null || true
+
+    if [[ ${#disk_swaps[@]} -gt 1 ]]; then
+      msg "$(c_yel "[!] Найдено несколько дисковых swap (${#disk_swaps[@]}): ${disk_swaps[*]}")"
+      printf '%s' "$(c_yel "[?] Удалить лишние, оставив $swap_target? (y/n): ")" >&2
+      local ans2; read -r ans2 < /dev/tty 2>/dev/null
+      if [[ "$ans2" =~ ^[yYдД]$ ]]; then
+        local extra
+        for extra in "${disk_swaps[@]:1}"; do
+          opt_run swapoff "$extra" 2>/dev/null || true
+          if [[ -f "$extra" ]]; then
+            opt_run rm -f "$extra" 2>/dev/null || true
+          else
+            msg "$(c_yel "[i] $extra — не обычный файл (раздел/устройство), не удаляю сам файл, только отключаю и убираю из fstab.")"
+          fi
+          opt_run awk -v e="$extra" '$1!=e' /etc/fstab | opt_run tee /etc/fstab.new >/dev/null \
+            && opt_run mv /etc/fstab.new /etc/fstab
+          msg "$(c_grn "[✓] Удалён лишний swap: $extra")"
+        done
+      else
+        msg "$(c_yel '[i] Лишние swap оставлены как есть — убери вручную при желании.')"
+      fi
+    fi
   fi
 
-  if ! grep -qE '^/swapfile[[:space:]]' /etc/fstab 2>/dev/null; then
-    echo '/swapfile none swap sw,pri=-2 0 0' | opt_run tee -a /etc/fstab >/dev/null
+  if grep -qF "$swap_target" /etc/fstab 2>/dev/null; then
+    opt_run awk -v t="$swap_target" '
+      $1==t {
+        if ($4 ~ /pri=/) { gsub(/pri=-?[0-9]+/, "pri=-2", $4) }
+        else { $4 = $4 ",pri=-2" }
+      }
+      { print }
+    ' /etc/fstab | opt_run tee /etc/fstab.new >/dev/null && opt_run mv /etc/fstab.new /etc/fstab
+  else
+    echo "$swap_target none swap sw,pri=-2 0 0" | opt_run tee -a /etc/fstab >/dev/null
   fi
-  msg "$(c_grn '[✓] Swap настроен (приоритет -2).')"
+  msg "$(c_grn "[✓] Swap настроен (приоритет -2): $swap_target")"
 
-  # --- vm.swappiness: 100 с ZRAM, 10 без ---
+  # --- vm.swappiness: 100 с активным ZRAM, 10 без ---
   local swappiness
   if [ "${zram_ok}" -eq 1 ]; then swappiness=100; else swappiness=10; fi
   echo "vm.swappiness=${swappiness}" | opt_run tee /etc/sysctl.d/99-swappiness.conf >/dev/null
@@ -776,13 +847,24 @@ setup_bbr_cake(){
     msg "$(c_grn '[✓] Конфликтующие строки в /etc/sysctl.conf закомментированы (если были).')"
   fi
 
-  local conflict
-  conflict=$(grep -lE '^[[:space:]]*(net\.core\.default_qdisc|net\.ipv4\.tcp_congestion_control)[[:space:]]*=' /etc/sysctl.d/*.conf 2>/dev/null | grep -v '99-zz-bbr-cake.conf')
-  if [[ -n "$conflict" ]]; then
-    msg "$(c_yel '[!] Найдены конфликтующие настройки в других файлах sysctl.d:')"
-    while IFS= read -r f; do msg "$(c_yel "      - $f")"; done <<< "$conflict"
-    msg "$(c_yel '    Проверь их вручную — приоритет применения зависит от алфавитного порядка имён.')"
-  fi
+  local f
+  for f in /etc/sysctl.d/*.conf; do
+    [[ -f "$f" ]] || continue
+    [[ "$(basename "$f")" == "99-zz-bbr-cake.conf" ]] && continue
+    grep -qE '^[[:space:]]*(net\.core\.default_qdisc|net\.ipv4\.tcp_congestion_control)[[:space:]]*=' "$f" 2>/dev/null || continue
+
+    local f_qdisc f_cc other_lines
+    f_qdisc=$(grep -E '^[[:space:]]*net\.core\.default_qdisc[[:space:]]*=' "$f" | tail -n1 | sed -E 's/.*=[[:space:]]*//')
+    f_cc=$(grep -E '^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]]*=' "$f" | tail -n1 | sed -E 's/.*=[[:space:]]*//')
+    other_lines=$(grep -vE '^[[:space:]]*(#|$|net\.core\.default_qdisc|net\.ipv4\.tcp_congestion_control)' "$f")
+
+    if [[ "$f_qdisc" == "$qdisc" && "$f_cc" == "bbr" && -z "$other_lines" ]]; then
+      opt_run rm -f "$f"
+      msg "$(c_grn "[✓] Удалён старый дублирующий конфиг: $f (совпадает с текущим).")"
+    else
+      msg "$(c_yel "[!] Конфликтующий файл с другими настройками: $f — проверь вручную.")"
+    fi
+  done
 
   # --- 3. применение без ребута ---
   msg "$(c_yel '[*] Загружаю модули ядра...')"
@@ -816,6 +898,7 @@ setup_bbr_cake(){
     | while IFS= read -r l; do msg "  $l"; done
   if [[ -n "$iface" ]]; then
     tc qdisc show dev "$iface" 2>/dev/null | while IFS= read -r l; do msg "  $l"; done
+    msg "$(c_cyn '[i] "qdisc mq root" с cake на дочерних очередях (parent :1, :2, ...) — норма для multi-queue сетевух, не ошибка.')"
   fi
 }
 
