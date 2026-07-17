@@ -842,8 +842,8 @@ setup_bbr_cake(){
     | opt_run tee /etc/sysctl.d/99-zz-bbr-cake.conf >/dev/null
   msg "$(c_grn '[✓] Записан /etc/sysctl.d/99-zz-bbr-cake.conf (применяется последним по алфавиту).')"
 
-  printf 'tcp_bbr\n%s\n' "$qmod" | opt_run tee /etc/modules-load.d/bbr-cake.conf >/dev/null
-  msg "$(c_grn '[✓] Автозагрузка модулей: /etc/modules-load.d/bbr-cake.conf.')"
+  printf 'tcp_bbr\n%s\nnf_conntrack\n' "$qmod" | opt_run tee /etc/modules-load.d/bbr-cake.conf >/dev/null
+  msg "$(c_grn "[✓] Автозагрузка модулей: /etc/modules-load.d/bbr-cake.conf (tcp_bbr, $qmod, nf_conntrack).")"
 
   if [[ -f /etc/sysctl.d/99-reshala-boost.conf ]]; then
     opt_run rm -f /etc/sysctl.d/99-reshala-boost.conf
@@ -882,6 +882,7 @@ setup_bbr_cake(){
   msg "$(c_yel '[*] Загружаю модули ядра...')"
   opt_run modprobe tcp_bbr 2>/dev/null
   opt_run modprobe "$qmod" 2>/dev/null
+  opt_run modprobe nf_conntrack 2>/dev/null
 
   msg "$(c_yel '[*] Применяю sysctl --system...')"
   if ! opt_run sysctl --system >/dev/null 2>&1; then
@@ -946,7 +947,7 @@ opt_node_limits(){
   )
 
   local have_conntrack=0
-  if lsmod | grep -q nf_conntrack; then
+  if [ -f /proc/sys/net/netfilter/nf_conntrack_max ]; then
     have_conntrack=1
     lines+=("net.netfilter.nf_conntrack_max = ${conntrack_max}")
   else
@@ -956,11 +957,14 @@ opt_node_limits(){
   printf '%s\n' "${lines[@]}" | opt_run tee /etc/sysctl.d/99-zz-node-limits.conf >/dev/null
   msg "$(c_grn '[✓] Записан /etc/sysctl.d/99-zz-node-limits.conf.')"
 
+  # root не матчится маской "*" в pam_limits — прописываем отдельно
   printf '%s\n' \
     "* soft nofile 1048576" \
     "* hard nofile 1048576" \
+    "root soft nofile 1048576" \
+    "root hard nofile 1048576" \
     | opt_run tee /etc/security/limits.d/99-node.conf >/dev/null
-  msg "$(c_grn '[✓] Записан /etc/security/limits.d/99-node.conf (nofile 1048576).')"
+  msg "$(c_grn '[✓] Записан /etc/security/limits.d/99-node.conf (nofile 1048576, включая root).')"
 
   msg "$(c_yel '[*] Применяю sysctl --system...')"
   if ! opt_run sysctl --system >/dev/null 2>&1; then
@@ -975,6 +979,7 @@ opt_node_limits(){
   [[ "$have_conntrack" -eq 1 ]] && ctl_keys+=(net.netfilter.nf_conntrack_max)
   ctl_keys+=(fs.file-max)
   opt_run sysctl "${ctl_keys[@]}" 2>/dev/null | while IFS= read -r l; do msg "  $l"; done
+  msg "$(c_cyn '[i] ulimit -n обновится в новой сессии (релогин/ребут).')"
 }
 
 # ----------------------------------------------------------------------------
