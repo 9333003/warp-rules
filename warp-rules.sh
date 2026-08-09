@@ -978,12 +978,18 @@ NA_SCANLIST_REF="${NA_SCANLIST_REF:-aa4c79a665007bc6df00f53c0622cd9fa8aaef81}"
 # именно этот дефолт показывается в шапке и уходит в первый прогон protect.
 TCP_PORTS="${TCP_PORTS:-80,443}"
 
+# Сносить legacy ufw/iptables автоматически сразу после того, как confirm
+# реально снял ВЗВЕДЁННЫЙ сейфти-таймер (не при холостом нажатии). Дефолт 1 —
+# осознанное решение владельца (скрипт непубличный, использует только он).
+# 0 через «Параметры» — вернуться к ручному пункту «Обслуживание» с YES.
+AUTO_REMOVE_LEGACY_FIREWALL="${AUTO_REMOVE_LEGACY_FIREWALL:-1}"
+
 # ключи node-accelerator, которые warp-rules передаёт через ENV (см. 6.3.4 ТЗ)
 NA_UPSTREAM_KEYS=(SSH_PORT TCP_PORTS UDP_PORTS NODE_PORT WHITELIST SAFETY_DELAY \
                   ENABLE_BLOCKLISTS BLOCK_TOR ENABLE_CTGUARD \
                   ENABLE_XANMOD QDISC REMNAWAVE_SWAP_SIZE NODE_PORT_WHITELIST_ONLY)
 # свои ключи (не из node-accelerator) — тоже хранятся в harden.env
-WR_OWN_KEYS=(NA_GEOBLOCK_COUNTRIES REMOVE_LEGACY_FIREWALL)
+WR_OWN_KEYS=(NA_GEOBLOCK_COUNTRIES AUTO_REMOVE_LEGACY_FIREWALL)
 NA_ENV_KEYS=("${NA_UPSTREAM_KEYS[@]}" "${WR_OWN_KEYS[@]}")
 
 na_require_root(){ [[ $EUID -eq 0 ]] || { msg "$(c_red '[!] Нужен root: перезапусти через sudo (node-accelerator работает только от root).')"; return 1; }; }
@@ -1397,6 +1403,11 @@ na_confirm(){
     return 1
   fi
   msg "$(c_grn '[✓] Авто-откат снят. Защита активна на постоянной основе.')"
+  na_load_env
+  if [[ "${AUTO_REMOVE_LEGACY_FIREWALL:-1}" == 1 ]]; then
+    na_do_remove_legacy_firewall
+    msg "$(c_grn '[✓] Legacy-firewall снесён автоматически после подтверждения доступа.')"
+  fi
 }
 
 # ── CrowdSec: привязка к remnawave-nginx (без этого CrowdSec работает вхолостую) ──
@@ -1565,9 +1576,8 @@ na_whitelist_add(){
   done
   [[ "$added" -eq 1 ]] || { msg "$(c_yel '[i] Нечего добавлять.')"; return 0; }
   na_set_param WHITELIST "$new"
-  msg "$(c_cyn '[*] Применяю через protect...')"
-  na_apply protect
-  msg "$(c_yel '[i] Не забудь «Подтвердить доступ» после проверки SSH/HTTPS.')"
+  msg "$(c_grn "[✓] WHITELIST → ${new:-(пусто)}")"
+  na_apply_prompt protect
 }
 
 na_whitelist_remove(){
@@ -1585,12 +1595,31 @@ na_whitelist_remove(){
   local -a items; IFS=',' read -ra items <<<"$cur"
   for e in "${items[@]}"; do [[ "$e" == "$ip" ]] || new="${new:+$new,}$e"; done
   na_set_param WHITELIST "$new"
-  na_apply protect
-  msg "$(c_yel '[i] Не забудь «Подтвердить доступ» после проверки SSH/HTTPS.')"
+  msg "$(c_grn "[✓] WHITELIST → ${new:-(пусто)}")"
+  na_apply_prompt protect
 }
 
-na_ports_edit(){
-  local action="$1" key p
+# Единый паттерн после накопленной правки (whitelist/порты): применить сразу
+# или отложить до явного «1. Применить» в корневом меню — Y по умолчанию
+# (не ломает привычный разовый сценарий «просто открой порт»), n — правка
+# остаётся в harden.env без ре-рана protect (не взводит сейфти-таймер зря
+# на каждую мелкую правку, если их копится несколько подряд).
+na_apply_prompt(){
+  local mode="$1"
+  printf '%s' "$(c_yel '[?] Применить сейчас? (Y/n): ')" >&2
+  local yn; read -r yn < /dev/tty 2>/dev/null
+  if [[ -z "$yn" || "$yn" =~ ^[yYдД]$ ]]; then
+    na_apply "$mode"
+  else
+    msg "$(c_yel '[i] Сохранено, не применено. Когда закончишь править — «1. Применить» в меню «Оптимизация и защита ноды».')"
+  fi
+}
+
+# Объединённый «Открыть»/«Закрыть» порт: протокол → текущий список → добавить
+# ИЛИ убрать несколько портов за один проход (вместо отдельного полного
+# прохода меню на каждый порт).
+na_ports_change(){
+  local key p
   msg "  1. TCP  2. UDP"
   printf '%s' "$(c_yel '[?] Протокол (1/2): ')" >&2
   read -r p < /dev/tty 2>/dev/null
@@ -1598,12 +1627,17 @@ na_ports_edit(){
   local cur; cur="$(na_get "$NA_CONF_DIR/protect.conf" "$key")"
   if [[ -z "$cur" ]]; then na_load_env; cur="${!key:-}"; fi
   msg "  Текущие порты ($key): ${cur:-(пусто)}"
-  printf '%s' "$(c_yel "[?] Порт(ы) для действия «$action» (через запятую): ")" >&2
+  msg "  1. Добавить"
+  msg "  2. Убрать"
+  printf '%s' "$(c_yel '[?] Действие (1/2): ')" >&2
+  local act action; read -r act < /dev/tty 2>/dev/null
+  case "$act" in 1) action=добавить ;; 2) action=убрать ;; *) msg "$(c_red 'Отмена.')"; return 1 ;; esac
+  printf '%s' "$(c_yel "[?] Порт(ы) — $action (через запятую, можно несколько): ")" >&2
   local ports; read -r ports < /dev/tty 2>/dev/null
   if ! na_validate_ports "$ports"; then msg "$(c_red '[!] Некорректный список портов.')"; return 1; fi
   local new pp
   local -a req; IFS=',' read -ra req <<<"$ports"
-  if [[ "$action" == открыть ]]; then
+  if [[ "$action" == добавить ]]; then
     new="$cur"
     for pp in "${req[@]}"; do [[ ",$new," == *",$pp,"* ]] || new="${new:+$new,}$pp"; done
   else
@@ -1616,8 +1650,8 @@ na_ports_edit(){
   fi
   na_require_root || return 1
   na_set_param "$key" "$new"
-  na_apply protect
-  msg "$(c_yel '[i] Не забудь «Подтвердить доступ» после проверки SSH/HTTPS.')"
+  msg "$(c_grn "[✓] $key → ${new:-(пусто)}")"
+  na_apply_prompt protect
 }
 
 # «пожарный» допуск — прямой nft add element, без ре-рана, до перезапуска na-firewall/ребута
@@ -1663,21 +1697,19 @@ na_menu_whitelist(){
     msg "  1. Показать кандидатов (na-fw-top-talkers)"
     msg "  2. Добавить IP/CIDR в whitelist"
     msg "  3. Убрать IP/CIDR из whitelist"
-    msg "  4. Открыть порт (TCP/UDP)"
-    msg "  5. Закрыть порт"
-    msg "  6. Пожарный допуск (без ре-рана, до перезапуска)"
-    msg "  7. Проверить IP (na-report --ip)"
+    msg "  4. Изменить порты (открыть/закрыть)"
+    msg "  5. Пожарный допуск (без ре-рана, до перезапуска)"
+    msg "  6. Проверить IP (na-report --ip)"
     msg "  0. Назад"
-    printf '%s' "$(c_yel '[?] Выбор (0-7): ')" >&2
+    printf '%s' "$(c_yel '[?] Выбор (0-6): ')" >&2
     local c; read -r c < /dev/tty 2>/dev/null || return 1
     case "$c" in
       1) if command -v na-fw-top-talkers >/dev/null 2>&1; then na-fw-top-talkers; else msg "$(c_yel '[i] Ещё не установлено.')"; fi ;;
       2) na_whitelist_add ;;
       3) na_whitelist_remove ;;
-      4) na_ports_edit открыть ;;
-      5) na_ports_edit закрыть ;;
-      6) na_firewall_emergency_admit ;;
-      7) na_report_ip ;;
+      4) na_ports_change ;;
+      5) na_firewall_emergency_admit ;;
+      6) na_report_ip ;;
       0) return 0 ;;
       *) msg "$(c_red 'Неверный выбор, повтори.')" ;;
     esac
@@ -1701,12 +1733,15 @@ na_menu_params(){
     msg "$(printf '  %-22s %-20s %s' "$k" "$declared" "(своё, не из node-accelerator)")"
   done
   msg ""
+  msg "$(c_cyn '[i] TCP_PORTS/UDP_PORTS — только просмотр здесь; правка через «Белый список и порты → Изменить порты».')"
   printf '%s' "$(c_yel '[?] Enter — назад, либо KEY=value чтобы задать (применится при следующем apply): ')" >&2
   local line; read -r line < /dev/tty 2>/dev/null
   [[ -z "$line" ]] && return 0
   if [[ "$line" =~ ^([A-Z_]+)=(.*)$ ]]; then
     local kk="${BASH_REMATCH[1]}" vv="${BASH_REMATCH[2]}"
-    if in_list "$kk" "${NA_ENV_KEYS[@]}"; then
+    if [[ "$kk" == TCP_PORTS || "$kk" == UDP_PORTS ]]; then
+      msg "$(c_yel "[i] $kk редактируется только через «Белый список и порты → Изменить порты» — там сразу видно текущее значение и можно применить.")"
+    elif in_list "$kk" "${NA_ENV_KEYS[@]}"; then
       na_require_root || return 1
       na_set_param "$kk" "$vv"
       msg "$(c_grn "[✓] $kk=$vv сохранено в $WR_HARDEN_ENV.")"
@@ -1748,13 +1783,10 @@ na_menu_status(){
 # legacy ufw/iptables — по умолчанию НЕ трогаем (protect.sh намеренно живёт
 # рядом с чужими правилами). Флаш только INPUT (не FORWARD — там цепочки
 # Docker, донорский `iptables -F` без указания цепочки их вычищал, 5.1 ТЗ).
-na_remove_legacy_firewall(){
-  na_require_root || return 1
-  msg "$(c_yel '[!] Снятие legacy ufw/iptables. По умолчанию мы их не трогаем — убедись, что')"
-  msg "$(c_yel '    na_filter уже применена и SSH-доступ подтверждён (пункт «Подтвердить доступ»).')"
-  printf '%s' "$(c_yel '[?] Точно продолжить? Наберите YES: ')" >&2
-  local ans; read -r ans < /dev/tty 2>/dev/null
-  [[ "$ans" == "YES" ]] || { msg "$(c_yel 'Отменено.')"; return 0; }
+# Собственно работа — без запроса подтверждения. Вызывается из двух мест:
+# na_confirm (автоматически, только после реального снятия сейфти-таймера)
+# и na_remove_legacy_firewall (вручную, после явного YES).
+na_do_remove_legacy_firewall(){
   na_snapshot
   systemctl disable --now ufw.service 2>/dev/null || true
   apt-get purge -y ufw >/dev/null 2>&1 || true
@@ -1774,6 +1806,16 @@ na_remove_legacy_firewall(){
       msg "$(c_yel '[!] Не удалось подтвердить связность из remnanode автоматически (нет curl в образе или сеть режется) — проверь вручную.')"
     fi
   fi
+}
+
+na_remove_legacy_firewall(){
+  na_require_root || return 1
+  msg "$(c_yel '[!] Снятие legacy ufw/iptables. По умолчанию мы их не трогаем — убедись, что')"
+  msg "$(c_yel '    na_filter уже применена и SSH-доступ подтверждён (пункт «Подтвердить доступ»).')"
+  printf '%s' "$(c_yel '[?] Точно продолжить? Наберите YES: ')" >&2
+  local ans; read -r ans < /dev/tty 2>/dev/null
+  [[ "$ans" == "YES" ]] || { msg "$(c_yel 'Отменено.')"; return 0; }
+  na_do_remove_legacy_firewall
 }
 
 na_menu_maintenance(){
