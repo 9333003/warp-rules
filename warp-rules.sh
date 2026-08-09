@@ -971,10 +971,17 @@ NA_MIN_CUSTOM_BLOCKLIST_CIDRS=1000
 # коммит shadow-netlab/traffic-guard-lists, проверен вручную перед переносом (раздел 4.2 ТЗ)
 NA_SCANLIST_REF="${NA_SCANLIST_REF:-aa4c79a665007bc6df00f53c0622cd9fa8aaef81}"
 
+# Свой дефолт TCP-портов вместо унаследованного от node-accelerator "443,2087".
+# 80 — для HTTP-01 (Let's Encrypt), обновление серта selfsteal-домена почти
+# всегда идёт через него; 2087 — дефолт апстрима без привязки к Remnawave,
+# смысла в нём для наших нод нет, убран. Действует до первого apply тоже —
+# именно этот дефолт показывается в шапке и уходит в первый прогон protect.
+TCP_PORTS="${TCP_PORTS:-80,443}"
+
 # ключи node-accelerator, которые warp-rules передаёт через ENV (см. 6.3.4 ТЗ)
 NA_UPSTREAM_KEYS=(SSH_PORT TCP_PORTS UDP_PORTS NODE_PORT WHITELIST SAFETY_DELAY \
                   ENABLE_BLOCKLISTS BLOCK_TOR ENABLE_CTGUARD \
-                  ENABLE_XANMOD QDISC REMNAWAVE_SWAP_SIZE)
+                  ENABLE_XANMOD QDISC REMNAWAVE_SWAP_SIZE NODE_PORT_WHITELIST_ONLY)
 # свои ключи (не из node-accelerator) — тоже хранятся в harden.env
 WR_OWN_KEYS=(NA_GEOBLOCK_COUNTRIES REMOVE_LEGACY_FIREWALL)
 NA_ENV_KEYS=("${NA_UPSTREAM_KEYS[@]}" "${WR_OWN_KEYS[@]}")
@@ -1189,14 +1196,77 @@ na_download_install(){
 
 # если WHITELIST пуст — спросить IP панели (иначе она рискует остаться без
 # admin-доступа к порту ноды при первом же protect); пусто = продолжить на свой риск
+# Порт node-agent — та же логика приоритетов, что у detect_node_port() в
+# node-accelerator: docker env NODE_PORT/APP_PORT контейнера remnanode →
+# сохранённый NODE_PORT в protect.conf → известные дефолты. Реальный шаблон
+# docker-compose eGamesAPI/remnawave-reverse-proxy кладёт в remnanode ТОЛЬКО
+# NODE_PORT и SECRET_KEY — никакого URL/IP панели там нет (проверено по
+# исходнику install_node.sh), поэтому определять порт можно, а адрес панели
+# из env контейнера — нельзя (см. комментарий в na_detect_panel_ip_candidates).
+na_detect_node_port(){
+  local p
+  if command -v docker >/dev/null 2>&1 && docker inspect remnanode >/dev/null 2>&1; then
+    p="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' remnanode 2>/dev/null \
+         | awk -F= '$1=="NODE_PORT"||$1=="APP_PORT"{print $2; exit}')"
+    [[ -n "$p" ]] && { printf '%s' "$p"; return 0; }
+  fi
+  p="$(na_get "$NA_CONF_DIR/protect.conf" NODE_PORT)"
+  [[ -n "$p" && "$p" != "auto" ]] && { printf '%s' "$p"; return 0; }
+  printf '%s' "2222,3000"
+}
+
+# Кандидаты на IP панели: у remnanode нет env-переменной с адресом панели
+# (докер-шаблон Remnawave её просто не создаёт — панель САМА ходит к ноде,
+# а не наоборот), поэтому единственный практичный признак — established-
+# соединения на node-порт прямо сейчас. Тот же принцип, что у
+# harvest_node_port_peers в protect.sh, только своими силами: на первом
+# apply protect.conf ещё может не существовать.
+na_detect_panel_ip_candidates(){
+  local ports port filt=""
+  ports="$(na_detect_node_port)"
+  for port in ${ports//,/ }; do
+    [[ "$port" =~ ^[0-9]+$ ]] || continue
+    filt="${filt:+$filt or }sport = :$port"
+  done
+  [[ -n "$filt" ]] || return 1
+  ss -Hnt state established "( $filt )" 2>/dev/null \
+    | awk '{print $NF}' | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//' \
+    | sed -E 's/^::ffff:([0-9.]+)$/\1/' \
+    | awk 'NF && $0!="127.0.0.1" && $0!="::1"' | sort -u
+}
+
 na_ensure_whitelist(){
   na_load_env
   local cur="${WHITELIST:-}"
   [[ -z "$cur" ]] && cur="$(na_get "$NA_CONF_DIR/protect.conf" WHITELIST)"
   [[ -n "$cur" ]] && return 0
   msg "$(c_yel '[!] WHITELIST пуст. Без IP панели/мониторинга при первом apply есть риск не достучаться до порта ноды.')"
-  printf '%s' "$(c_yel '[?] IP/CIDR панели через запятую (Enter — пропустить на свой риск): ')" >&2
-  local ans; read -r ans < /dev/tty 2>/dev/null
+
+  local -a cands=()
+  mapfile -t cands < <(na_detect_panel_ip_candidates)
+  local ans=""
+  if [[ ${#cands[@]} -eq 1 ]]; then
+    msg "$(c_cyn "[*] Node-порт сейчас держит соединение с ${cands[0]} — похоже, это панель.")"
+    printf '%s' "$(c_yel "[?] Использовать ${cands[0]} как WHITELIST? (Y/n): ")" >&2
+    local yn; read -r yn < /dev/tty 2>/dev/null
+    [[ -z "$yn" || "$yn" =~ ^[yYдД]$ ]] && ans="${cands[0]}"
+  elif [[ ${#cands[@]} -gt 1 ]]; then
+    msg "$(c_cyn '[*] Node-порт сейчас держат несколько соединений — выбери, какое из них панель:')"
+    local i
+    for i in "${!cands[@]}"; do msg "  $((i+1)). ${cands[$i]}"; done
+    msg "  0. Ни одно (ввести вручную / пропустить)"
+    printf '%s' "$(c_yel "[?] Выбор (0-${#cands[@]}): ")" >&2
+    local pick; read -r pick < /dev/tty 2>/dev/null
+    if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#cands[@]} )); then
+      ans="${cands[$((pick-1))]}"
+    fi
+  fi
+
+  if [[ -z "$ans" ]]; then
+    printf '%s' "$(c_yel '[?] IP/CIDR панели через запятую (Enter — пропустить на свой риск): ')" >&2
+    read -r ans < /dev/tty 2>/dev/null
+  fi
+
   if [[ -n "$ans" ]]; then
     if ! na_validate_whitelist "$ans"; then
       msg "$(c_red '[!] Некорректный формат IP/CIDR — apply отменён.')"
@@ -1207,6 +1277,23 @@ na_ensure_whitelist(){
     msg "$(c_yel '[i] Продолжаю без WHITELIST.')"
   fi
   return 0
+}
+
+# Пост-проверка после protect: na_nodeport_wl_v4 наполняется из established-
+# пиров node-порта В МОМЕНТ прогона (см. harvest_node_port_peers в
+# protect.sh) — это НЕ то же самое, что WHITELIST, и пустой сет сам по себе
+# не поломка (панель может быть неактивна ровно в этот момент). Проверка
+# честно объясняет разницу, а не молча сравнивает множества.
+na_check_nodeport_wl(){
+  nft list table inet na_filter >/dev/null 2>&1 || return 0
+  nft list set inet na_filter na_nodeport_wl_v4 >/dev/null 2>&1 || return 0
+  local elems
+  elems="$(nft list set inet na_filter na_nodeport_wl_v4 2>/dev/null | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | paste -sd, -)"
+  if [[ -z "$elems" ]]; then
+    msg "$(c_yel '[!] na_nodeport_wl_v4 пуст. Это нормально, если панель прямо сейчас не держит соединение с node-портом — сет наполняется established-пирами в момент прогона, не копией WHITELIST. Если панель ИМЕННО СЕЙЧАС теряет доступ: «Белый список и порты → Пожарный допуск» (временно, до рестарта), либо повтори apply, пока панель активно опрашивает ноду.')"
+  else
+    msg "$(c_grn "[✓] na_nodeport_wl_v4: $elems")"
+  fi
 }
 
 # ── применить: optimize|protect|all — отдельным процессом (8.1 ТЗ) ──
@@ -1248,11 +1335,25 @@ na_apply(){
   na_load_env
   local -a envp=(NA_REF="$NA_REF" NA_REPO_URL="$NA_REPO_URL" NA_REQUIRE_SIG="$NA_REQUIRE_SIG" \
                  NA_MINISIGN_PUBKEY="$NA_MINISIGN_PUBKEY" REMNAWAVE_NONINTERACTIVE=1)
-  local k v
+  local k v npwl_declared=0
   for k in "${NA_UPSTREAM_KEYS[@]}"; do
     v="${!k-}"
-    [[ -n "$v" ]] && envp+=("$k=$v")
+    if [[ -n "$v" ]]; then
+      envp+=("$k=$v")
+      [[ "$k" == NODE_PORT_WHITELIST_ONLY ]] && npwl_declared=1
+    fi
   done
+  # protect.sh резолвит NODE_PORT_WHITELIST_ONLY=auto в буквальную 1 и
+  # ПЕРСИСТИТ её такой в protect.conf (см. save_conf). На повторном прогоне
+  # load_conf подставляет уже не "auto", а "1" — скрипт больше не может
+  # отличить это от явного intent'а оператора и отключает авто-допуск
+  # established-пиров панели в na_nodeport_wl_* (баг апстрима, поймано на
+  # реальной ноде: работает на первом apply, пропадает на втором). Форсируем
+  # "auto" на каждом protect/all, если оператор сам не задал другое значение
+  # через «Параметры».
+  if [[ "$npwl_declared" -eq 0 && ( "$mode" == protect || "$mode" == all ) ]]; then
+    envp+=("NODE_PORT_WHITELIST_ONLY=auto")
+  fi
 
   msg "$(c_cyn "[*] Запускаю node-accelerator $mode ($NA_REF)...")"
   env "${envp[@]}" bash "$tmp" "$mode"
@@ -1264,6 +1365,7 @@ na_apply(){
     if [[ "$mode" == protect || "$mode" == all ]]; then
       na_configure_crowdsec_remnawave
       na_write_blocklist_updater
+      na_check_nodeport_wl
       msg ""
       msg "$(c_red "[!] Сейфти-таймер взведён (${SAFETY_DELAY:-900}с). Проверь SSH и HTTPS из ОТДЕЛЬНОЙ сессии, затем пункт «Подтвердить доступ».")"
     fi
@@ -1768,9 +1870,13 @@ mode_na_hardening(){
     msg "  Сеть:  na_filter $fw · CrowdSec $crowd · bouncer $bouncer"
     wl="$(na_get "$NA_CONF_DIR/protect.conf" WHITELIST)"
     tcp="$(na_get "$NA_CONF_DIR/protect.conf" TCP_PORTS)"
+    # до первого apply protect.conf ещё не существует — показываем то, что
+    # реально уйдёт в прогон (наш дефолт/harden.env), а не голый "?"
+    [[ -z "$tcp" ]] && { na_load_env; tcp="${TCP_PORTS:-}"; }
     udp="$(na_get "$NA_CONF_DIR/protect.conf" UDP_PORTS)"
+    [[ -z "$udp" ]] && { na_load_env; udp="${UDP_PORTS:-}"; }
     ssh="$(na_get "$NA_CONF_DIR/protect.conf" SSH_PORT)"
-    msg "  Порты: TCP ${tcp:-?} · UDP ${udp:-—} · SSH ${ssh:-авто}"
+    msg "  Порты: TCP ${tcp:-?} · UDP ${udp:-авто} · SSH ${ssh:-авто}"
     if na_safety_armed; then
       local secs; secs="$(na_safety_remaining_s 2>/dev/null)"
       msg "  $(c_red "Авто-откат: ВЗВЕДЁН${secs:+, осталось ${secs}с}")"
