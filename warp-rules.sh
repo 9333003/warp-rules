@@ -1054,7 +1054,14 @@ na_installed(){ [[ -d "$NA_CONF_DIR" ]]; }
 
 # nод-accelerator v3.9.2 уже персистит этот маркер сам (optimize.sh, $STATE_DIR/optimize.installed) —
 # свой маркер поверх писать не нужно, читаем готовый (см. отчёт: расхождение с 1.3/4.5 ТЗ)
-na_reboot_needed(){ grep -q '^reboot_needed=1' "$NA_STATE_DIR/optimize.installed" 2>/dev/null; }
+# Маркер reboot_needed пишет optimize.sh В МОМЕНТ установки ядра и обновляет
+# только при следующем прогоне optimize — сам факт ребута его не снимает.
+# Сверяем с реальным uname -r, иначе после ребута в XanMod ещё долго висело
+# бы ложное «ТРЕБУЕТСЯ РЕБУТ» (поймано на реальной ноде).
+na_reboot_needed(){
+  uname -r | grep -qi xanmod && return 1
+  grep -q '^reboot_needed=1' "$NA_STATE_DIR/optimize.installed" 2>/dev/null
+}
 
 na_safety_armed(){
   systemctl is-active --quiet na-fw-safety.timer 2>/dev/null && return 0
