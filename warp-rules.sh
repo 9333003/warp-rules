@@ -1750,8 +1750,11 @@ mode_na_hardening(){
     msg ""
     msg "$(c_cyn '──── Оптимизация и защита ноды ────')"
     kern="$(uname -r)"; qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null)"
-    swapsz="$(na_get "$NA_CONF_DIR/optimize.conf" REMNAWAVE_SWAP_SIZE)"
-    msg "  Ядро:  $kern · qdisc ${qdisc:-?} · swap ${swapsz:-?}"
+    # REMNAWAVE_SWAP_SIZE в optimize.sh — локальная переменная внутри функции
+    # настройки свопа, наружу в save_conf не попадает (optimize.conf её не
+    # хранит) — читаем реальное состояние системы, а не конфиг
+    swapsz="$(swapon --show=NAME,SIZE --noheadings 2>/dev/null | awk '{printf "%s%s", (NR>1?", ":""), $1" "$2}')"
+    msg "  Ядро:  $kern · qdisc ${qdisc:-?} · swap ${swapsz:-нет}"
     nft list table inet na_filter >/dev/null 2>&1 && fw="активен" || fw="нет"
     systemctl is-active --quiet crowdsec 2>/dev/null && crowd="ok" || crowd="—"
     systemctl is-active --quiet crowdsec-firewall-bouncer 2>/dev/null && bouncer="ok" || bouncer="—"
