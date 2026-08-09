@@ -5,8 +5,10 @@
 # Меню:
 #   1. Анализ сервера + генерация блока маршрутизации для WARP.
 #   2. Предварительная проверка пригодности WARP (до установки, с очисткой).
-#   3. Установка инструментов (Remnawave / TrafficGuard / Решала / Multitest).
-#   4. Оптимизация (память, docker-лимиты, логи).
+#   3. Установка инструментов (Remnawave / rw-backup / Multitest).
+#   4. Оптимизация и защита ноды — обёртка над node-accelerator
+#      (github.com/jestivald/node-accelerator): XanMod/BBRv3, sysctl,
+#      nftables + CrowdSec, блоклисты, откат.
 #   5. Обновление системы + фикс при сбоях (диагностика apt update,
 #      автофикс известных ошибок при необходимости, затем apt upgrade -y).
 #   6. Обновление / откат ноды Remnawave (выбор версии с GitHub, без потери
@@ -28,7 +30,7 @@
 set -uo pipefail
 
 # =========================== НАСТРОЙКИ =====================================
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="2.0.0"
 WARP_TAG="warp-out"
 IPREGION_URL="https://ipregion.vrnt.xyz"
 IPREGION_LOCAL="./ipregion.sh"
@@ -366,10 +368,6 @@ command -v remnawave_reverse >/dev/null 2>&1 && \
   printf "${YEL}⚡️ Быстрый запуск скрипта EGames:${RST}     ${GRN}remnawave_reverse${RST} (или ${GRN}rr${RST})\n"
 command -v rw-backup >/dev/null 2>&1 && \
   printf "${YEL}⚡️ Быстрый запуск бэкапов Remnawave:${RST}  ${GRN}rw-backup${RST}\n"
-command -v reshala >/dev/null 2>&1 && \
-  printf "${YEL}⚡️ Быстрый запуск Решалы:${RST}             ${GRN}reshala${RST}\n"
-command -v rknpidor >/dev/null 2>&1 && \
-  printf "${YEL}⚡️ Быстрый запуск TrafficGuard:${RST}       ${LBLU}rknpidor${RST}\n"
 command -v multitest >/dev/null 2>&1 && \
   printf "${YEL}⚡️ Быстрый запуск тестов:${RST}             ${LBLU}multitest${RST}\n"
 if command -v wrules >/dev/null 2>&1 && grep -q 'warp-rules' "$(command -v wrules)" 2>/dev/null; then
@@ -396,32 +394,25 @@ MOTD_EOF
 # =========================== РЕЖИМ 3: ИНСТРУМЕНТЫ ==========================
 mode_install_tools(){
   while :; do
-    local has_remnawave=false has_rwbackup=false has_reshala=false \
-          has_trafficguard=false has_multitest=false
+    local has_remnawave=false has_rwbackup=false has_multitest=false
     command -v remnawave_reverse >/dev/null 2>&1 && has_remnawave=true
     command -v rw-backup         >/dev/null 2>&1 && has_rwbackup=true
-    command -v reshala           >/dev/null 2>&1 && has_reshala=true
-    command -v rknpidor          >/dev/null 2>&1 && has_trafficguard=true
     command -v multitest         >/dev/null 2>&1 && has_multitest=true
 
     local -a KEYS=() LABELS=()
     $has_remnawave    || { KEYS+=("remnawave");    LABELS+=("Remnawave"); }
     $has_rwbackup     || { KEYS+=("rw-backup");    LABELS+=("rw-backup (бэкапы Remnawave)"); }
-    $has_reshala      || { KEYS+=("reshala");      LABELS+=("Решала"); }
-    $has_trafficguard || { KEYS+=("trafficguard"); LABELS+=("TrafficGuard"); }
     $has_multitest    || { KEYS+=("multitest");    LABELS+=("Multitest"); }
 
     msg ""
     msg "$(c_cyn '──── Установка инструментов ────')"
     $has_remnawave    && msg "  $(c_grn '[✓]') Remnawave"
     $has_rwbackup     && msg "  $(c_grn '[✓]') rw-backup"
-    $has_reshala      && msg "  $(c_grn '[✓]') Решала"
-    $has_trafficguard && msg "  $(c_grn '[✓]') TrafficGuard"
     $has_multitest    && msg "  $(c_grn '[✓]') Multitest"
 
     if [[ ${#KEYS[@]} -gt 0 ]]; then
       local any_inst=false
-      $has_remnawave || $has_rwbackup || $has_reshala || $has_trafficguard || $has_multitest \
+      $has_remnawave || $has_rwbackup || $has_multitest \
         && any_inst=true
       $any_inst && msg ""
       local i
@@ -460,56 +451,6 @@ WRAPPER
           update_motd
         else
           msg "$(c_red '[✗] Ошибка установки Remnawave.')"
-        fi
-        ;;
-      trafficguard)
-        msg "$(c_cyn '[*] Устанавливаю TrafficGuard (первичная настройка системы)...')"
-        local _tg_tmp; _tg_tmp=$(mktemp)
-        if curl -fsSL https://raw.githubusercontent.com/DonMatteoVPN/TrafficGuard-auto/refs/heads/main/install-trafficguard.sh \
-               -o "$_tg_tmp" \
-            && sed -i '/trafficguard-manager\.sh[[:space:]]*monitor/d' "$_tg_tmp" \
-            && bash "$_tg_tmp"; then
-          rm -f "$_tg_tmp"
-          if { cat > /usr/local/bin/rknpidor << 'WRAPPER'
-#!/usr/bin/env bash
-_tg=$(mktemp)
-curl -fsSL https://raw.githubusercontent.com/DonMatteoVPN/TrafficGuard-auto/refs/heads/main/install-trafficguard.sh \
-  -o "$_tg" 2>/dev/null \
-  && sed -i '/trafficguard-manager\.sh[[:space:]]*monitor/d' "$_tg" \
-  && bash "$_tg" >/dev/null 2>&1
-rm -f "$_tg"
-exec /opt/trafficguard-manager.sh monitor
-WRAPPER
-          } && chmod +x /usr/local/bin/rknpidor; then
-            msg "$(c_grn '[✓] TrafficGuard установлен.')"
-            update_motd
-          else
-            msg "$(c_red '[✗] Ошибка создания враппера rknpidor.')"
-          fi
-        else
-          rm -f "$_tg_tmp"
-          msg "$(c_red '[✗] Ошибка установки TrafficGuard.')"
-        fi
-        ;;
-      reshala)
-        msg "$(c_cyn '[*] Устанавливаю Решалу (первичная настройка)...')"
-        if wget -4 -q -O /tmp/install_reshala.sh \
-            https://raw.githubusercontent.com/DonMatteoVPN/Reshala-Remnawave-Bedolaga/main/install.sh \
-            && RESHALA_NO_AUTOSTART=1 bash /tmp/install_reshala.sh; then
-          rm -f /tmp/install_reshala.sh
-          if { cat > /usr/local/bin/reshala << 'WRAPPER'
-#!/usr/bin/env bash
-bash <(curl -fsSL https://raw.githubusercontent.com/DonMatteoVPN/Reshala-Remnawave-Bedolaga/main/install.sh) "$@"
-WRAPPER
-          } && chmod +x /usr/local/bin/reshala; then
-            msg "$(c_grn '[✓] Решала установлена.')"
-            update_motd
-          else
-            msg "$(c_red '[✗] Ошибка создания враппера reshala.')"
-          fi
-        else
-          rm -f /tmp/install_reshala.sh
-          msg "$(c_red '[✗] Ошибка установки Решалы.')"
         fi
         ;;
       rw-backup)
@@ -580,10 +521,6 @@ show_hints(){
     msg "$(c_yel '⚡️ Быстрый запуск скрипта EGames:') $(c_grn 'remnawave_reverse')  (или $(c_grn 'rr'))"; }
   command -v rw-backup >/dev/null 2>&1 && { any=true
     msg "$(c_yel '⚡️ Быстрый запуск бэкапов Remnawave:') $(c_grn 'rw-backup')"; }
-  command -v reshala >/dev/null 2>&1 && { any=true
-    msg "$(c_yel '⚡️ Быстрый запуск Решалы (настройки):') $(c_grn 'reshala')  («РЕШАЛА»)"; }
-  command -v rknpidor >/dev/null 2>&1 && { any=true
-    msg "$(c_yel '⚡️ Быстрый запуск TrafficGuard:') $(c_cyn 'rknpidor')"; }
   command -v multitest >/dev/null 2>&1 && { any=true
     msg "$(c_yel '⚡️ Быстрый запуск тестов:') $(c_cyn 'multitest')"; }
   command -v wrules >/dev/null 2>&1 \
@@ -607,18 +544,41 @@ show_hints(){
 }
 
 # =========================== МЕНЮ =========================================
+# Единый источник нумерации меню (8.2 ТЗ): номер → функция/подпись,
+# используется и в быстром запуске по аргументу, и в интерактивном цикле —
+# при перенумерации правится только здесь.
+declare -A MENU_FUNCS=(
+  [1]=mode_analyze
+  [2]=mode_test_warp
+  [3]=mode_install_tools
+  [4]=mode_na_hardening
+  [5]=fix_and_update
+  [6]=mode_remnanode_update
+  [7]=mode_xray_update
+)
+declare -A MENU_LABELS=(
+  [1]="Анализ сервера + блок для конфига"
+  [2]="Проверка пригодности WARP (до установки)"
+  [3]="Установка инструментов"
+  [4]="Оптимизация и защита ноды"
+  [5]="Обновление системы + фикс при сбоях"
+  [6]="Обновление / откат ноды Remnawave"
+  [7]="Обновление / откат Xray-Core (без обновления ноды)"
+)
+MENU_ORDER=(1 2 3 4 5 6 7)
+# пункты, которые в интерактивном меню сразу завершают скрипт (как при быстром запуске)
+MENU_EXIT_AFTER=(1 2)
+
 show_menu(){
   msg ""
   msg "$(c_cyn '═══════════  warp-rules  ═══════════')"
   local rn_status; rn_status=$(remnanode_status 2>/dev/null)
   [[ -n "$rn_status" ]] && msg "  $(c_yel 'Нода Remnawave:') $(c_grn "$rn_status")"
-  msg "  1. Анализ сервера + блок для конфига"
-  msg "  2. Проверка пригодности WARP (до установки)"
-  msg "  3. Установка инструментов (Remnawave / TrafficGuard / Решала / Multitest)"
-  msg "  4. Оптимизация (память, docker-лимиты, логи)"
-  msg "  5. Обновление системы + фикс при сбоях"
-  msg "  6. Обновление / откат ноды Remnawave"
-  msg "  7. Обновление / откат Xray-Core (без обновления ноды)"
+  na_header_lines
+  local i
+  for i in "${MENU_ORDER[@]}"; do
+    msg "  $i. ${MENU_LABELS[$i]}"
+  done
   msg "  0. Выход"
   msg "$(c_cyn '════════════════════════════════════')"
 }
@@ -629,36 +589,29 @@ main(){
   [[ -n "${WRULES_INVOKED:-}" ]] && check_for_update
   local choice="${1:-}"
 
-  # если первый аргумент 1/2/3 — запустить сразу, без меню
-  if [[ "$choice" == "1" ]]; then mode_analyze; return $?; fi
-  if [[ "$choice" == "2" ]]; then mode_test_warp; return $?; fi
-  if [[ "$choice" == "3" ]]; then mode_install_tools; return $?; fi
-  if [[ "$choice" == "4" ]]; then mode_optimization; return $?; fi
+  # если первый аргумент — номер пункта, запустить сразу, без меню
   if [[ "$choice" == "5" ]]; then
     local auto_flag=false a
     for a in "$@"; do [[ "$a" == "--auto" ]] && auto_flag=true; done
     if $auto_flag; then fix_and_update --auto; else fix_and_update; fi
     return $?
   fi
-  if [[ "$choice" == "6" ]]; then mode_remnanode_update; return $?; fi
-  if [[ "$choice" == "7" ]]; then mode_xray_update; return $?; fi
+  if [[ -n "$choice" && -n "${MENU_FUNCS[$choice]:-}" ]]; then
+    "${MENU_FUNCS[$choice]}"; return $?
+  fi
 
   # иначе показать меню и читать выбор с терминала
   while :; do
     show_menu
     printf '%s' "$(c_yel '[?] Выбор (0-7): ')" >&2
     read -r choice < /dev/tty 2>/dev/null || { msg ""; msg "Нет терминала. Запусти: bash warp-rules.sh 1  (или 2, 3, 4, 5, 6, 7)"; return 1; }
-    case "$choice" in
-      1) mode_analyze; return $? ;;
-      2) mode_test_warp; return $? ;;
-      3) mode_install_tools ;;
-      4) mode_optimization ;;
-      5) fix_and_update ;;
-      6) mode_remnanode_update ;;
-      7) mode_xray_update ;;
-      0) show_hints; update_motd; msg "Выход."; return 0 ;;
-      *) msg "$(c_red 'Неверный выбор, повтори.')" ;;
-    esac
+    if [[ "$choice" == "0" ]]; then show_hints; update_motd; msg "Выход."; return 0; fi
+    if [[ -n "${MENU_FUNCS[$choice]:-}" ]]; then
+      "${MENU_FUNCS[$choice]}"; local mode_rc=$?
+      in_list "$choice" "${MENU_EXIT_AFTER[@]}" && return "$mode_rc"
+    else
+      msg "$(c_red 'Неверный выбор, повтори.')"
+    fi
   done
 }
 
@@ -669,318 +622,6 @@ opt_run(){ if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
 
 # запустить python3 от root, сохраняя окружение
 opt_py(){ if [[ $EUID -eq 0 ]]; then python3 -; else sudo -E python3 -; fi; }
-
-# ----------------------------------------------------------------------------
-# 1. ГИБРИДНАЯ ПАМЯТЬ: ZRAM (приоритет 100) + disk swap (приоритет -2)
-# ----------------------------------------------------------------------------
-opt_hybrid_memory(){
-  local ram_mb
-  ram_mb=$(( $(grep MemTotal /proc/meminfo | awk '{print $2}') / 1024 ))
-
-  local zram_pct swap_mb
-  if   [ "$ram_mb" -le 1024 ]; then zram_pct=60; swap_mb=1024
-  elif [ "$ram_mb" -le 2048 ]; then zram_pct=50; swap_mb=1024
-  elif [ "$ram_mb" -le 4096 ]; then zram_pct=40; swap_mb=2048
-  else                              zram_pct=25; swap_mb=2048
-  fi
-
-  msg "$(c_cyn '─── Гибридная память (ZRAM + Swap) ───')"
-  msg "  RAM: $(c_grn "${ram_mb} MB")  →  ZRAM: $(c_grn "${zram_pct}%")  +  Swap: $(c_grn "${swap_mb} MB")"
-  msg ""
-
-  # --- ZRAM ---
-  local kernel_zram_ok=0 zram_ok=0 used_modules_extra=0
-  if opt_run modprobe zram 2>/dev/null || [ -e /sys/class/zram-control ]; then
-    kernel_zram_ok=1
-  else
-    local virt
-    virt=$(systemd-detect-virt 2>/dev/null); [[ -z "$virt" ]] && virt="unknown"
-    case "$virt" in
-      openvz|lxc|lxc-libvirt)
-        msg "$(c_yel "[!] ZRAM недоступен: контейнер ($virt) работает на общем ядре хоста — модуль zram нельзя загрузить отдельно.")"
-        ;;
-      *)
-        msg "$(c_yel "[!] Модуль zram не найден в текущем ядре (виртуализация: $virt).")"
-        printf '%s' "$(c_yel "[?] Установить linux-modules-extra-$(uname -r)? (y/n): ")" >&2
-        local ans; read -r ans < /dev/tty 2>/dev/null
-        if [[ "$ans" =~ ^[yYдД]$ ]]; then
-          used_modules_extra=1
-          msg "$(c_yel "[*] Устанавливаю linux-modules-extra-$(uname -r)...")"
-          if opt_run apt-get install -y "linux-modules-extra-$(uname -r)" >/dev/null 2>&1 && opt_run modprobe zram 2>/dev/null; then
-            msg "$(c_grn '[✓] Модуль zram установлен и загружен.')"
-            kernel_zram_ok=1
-          else
-            msg "$(c_red '[!] Не удалось установить/загрузить zram.')"
-          fi
-        fi
-        ;;
-    esac
-  fi
-
-  if [[ "$kernel_zram_ok" -eq 1 ]]; then
-    if ! dpkg -l zram-tools >/dev/null 2>&1; then
-      msg "$(c_yel '[*] Устанавливаю zram-tools...')"
-      opt_run apt-get install -y zram-tools >/dev/null 2>&1
-    fi
-    msg "$(c_yel '[*] Настраиваю ZRAM...')"
-    printf 'ALGO=zstd\nPERCENT=%s\nPRIORITY=100\n' "$zram_pct" | opt_run tee /etc/default/zramswap >/dev/null
-    opt_run systemctl enable zramswap >/dev/null 2>&1
-    opt_run systemctl restart zramswap >/dev/null 2>&1
-    if swapon --show 2>/dev/null | grep -q zram; then
-      msg "$(c_grn '[✓] ZRAM включён (zstd, приоритет 100).')"
-      zram_ok=1
-    else
-      msg "$(c_red '[!] ZRAM не поднялся после настройки. Останется только swap.')"
-    fi
-  else
-    msg "$(c_yel '    Будет настроен только дисковый swap.')"
-  fi
-
-  if [[ "$zram_ok" -eq 1 && "$used_modules_extra" -eq 1 ]]; then
-    msg "$(c_cyn "[i] Пакет linux-modules-extra-$(uname -r) привязан к версии ядра. После apt upgrade модуль обычно подтянется сам; если ZRAM пропадёт — переустанови пакет.")"
-  fi
-
-  # --- Дисковый swap (страховка, низкий приоритет) ---
-  local -a disk_swaps=()
-  local ds_name ds_type
-  while read -r ds_name ds_type; do
-    [[ -z "$ds_name" ]] && continue
-    [[ "$ds_name" == /dev/zram* ]] && continue
-    disk_swaps+=("$ds_name")
-  done < <(swapon --show=NAME,TYPE --noheadings 2>/dev/null)
-
-  local swap_target
-  if [[ ${#disk_swaps[@]} -eq 0 ]]; then
-    msg "$(c_yel "[*] Создаю /swapfile (${swap_mb} MB)...")"
-    opt_run fallocate -l "${swap_mb}M" /swapfile 2>/dev/null \
-      || opt_run dd if=/dev/zero of=/swapfile bs=1M count="${swap_mb}" status=none
-    opt_run chmod 600 /swapfile
-    opt_run mkswap /swapfile >/dev/null 2>&1
-    opt_run swapon -p -2 /swapfile 2>/dev/null || opt_run swapon /swapfile
-    swap_target="/swapfile"
-  else
-    swap_target="${disk_swaps[0]}"
-    msg "$(c_yel "[*] Дисковый swap уже есть: $swap_target — выставляю приоритет -2.")"
-    opt_run swapoff "$swap_target" 2>/dev/null || true
-    opt_run swapon -p -2 "$swap_target" 2>/dev/null || true
-
-    if [[ ${#disk_swaps[@]} -gt 1 ]]; then
-      msg "$(c_yel "[!] Найдено несколько дисковых swap (${#disk_swaps[@]}): ${disk_swaps[*]}")"
-      printf '%s' "$(c_yel "[?] Удалить лишние, оставив $swap_target? (y/n): ")" >&2
-      local ans2; read -r ans2 < /dev/tty 2>/dev/null
-      if [[ "$ans2" =~ ^[yYдД]$ ]]; then
-        local extra
-        for extra in "${disk_swaps[@]:1}"; do
-          opt_run swapoff "$extra" 2>/dev/null || true
-          if [[ -f "$extra" ]]; then
-            opt_run rm -f "$extra" 2>/dev/null || true
-          else
-            msg "$(c_yel "[i] $extra — не обычный файл (раздел/устройство), не удаляю сам файл, только отключаю и убираю из fstab.")"
-          fi
-          opt_run awk -v e="$extra" '$1!=e' /etc/fstab | opt_run tee /etc/fstab.new >/dev/null \
-            && opt_run mv /etc/fstab.new /etc/fstab
-          msg "$(c_grn "[✓] Удалён лишний swap: $extra")"
-        done
-      else
-        msg "$(c_yel '[i] Лишние swap оставлены как есть — убери вручную при желании.')"
-      fi
-    fi
-  fi
-
-  if grep -qF "$swap_target" /etc/fstab 2>/dev/null; then
-    opt_run awk -v t="$swap_target" '
-      $1==t {
-        if ($4 ~ /pri=/) { gsub(/pri=-?[0-9]+/, "pri=-2", $4) }
-        else { $4 = $4 ",pri=-2" }
-      }
-      { print }
-    ' /etc/fstab | opt_run tee /etc/fstab.new >/dev/null && opt_run mv /etc/fstab.new /etc/fstab
-  else
-    echo "$swap_target none swap sw,pri=-2 0 0" | opt_run tee -a /etc/fstab >/dev/null
-  fi
-  msg "$(c_grn "[✓] Swap настроен (приоритет -2): $swap_target")"
-
-  # --- vm.swappiness: 100 с активным ZRAM, 10 без ---
-  local swappiness
-  if [ "${zram_ok}" -eq 1 ]; then swappiness=100; else swappiness=10; fi
-  echo "vm.swappiness=${swappiness}" | opt_run tee /etc/sysctl.d/99-swappiness.conf >/dev/null
-  opt_run sysctl -w "vm.swappiness=${swappiness}" >/dev/null 2>&1
-  msg "$(c_grn "[✓] vm.swappiness=${swappiness}.")"
-}
-
-# ----------------------------------------------------------------------------
-# 1b. TCP ФОРСАЖ: BBR (congestion control) + CAKE (qdisc)
-# ----------------------------------------------------------------------------
-setup_bbr_cake(){
-  msg ""
-  msg "$(c_cyn '─── TCP форсаж: BBR + CAKE ───')"
-
-  local has_bbr=1 has_cake=1
-  modinfo tcp_bbr  >/dev/null 2>&1 || has_bbr=0
-  modinfo sch_cake >/dev/null 2>&1 || has_cake=0
-
-  if [[ "$has_bbr" -eq 0 ]]; then
-    msg "$(c_red '[!] tcp_bbr недоступен в этом ядре — BBR не может быть включён. Пропускаю.')"
-    return 1
-  fi
-
-  local qdisc="cake" qmod="sch_cake"
-  if [[ "$has_cake" -eq 0 ]]; then
-    msg "$(c_yel '[!] sch_cake недоступен (нужен Linux >= 4.19) — использую fq вместо cake.')"
-    qdisc="fq"; qmod="sch_fq"
-  fi
-
-  # --- 1. персистентность через ребут (BBR/CAKE + TCP-буферы для высокого RTT) ---
-  printf '%s\n' \
-    "net.core.default_qdisc = $qdisc" \
-    "net.ipv4.tcp_congestion_control = bbr" \
-    "net.core.rmem_max = 16777216" \
-    "net.core.wmem_max = 16777216" \
-    "net.ipv4.tcp_rmem = 4096 87380 16777216" \
-    "net.ipv4.tcp_wmem = 4096 65536 16777216" \
-    "net.ipv4.tcp_fastopen = 3" \
-    | opt_run tee /etc/sysctl.d/99-zz-bbr-cake.conf >/dev/null
-  msg "$(c_grn '[✓] Записан /etc/sysctl.d/99-zz-bbr-cake.conf (применяется последним по алфавиту).')"
-
-  printf 'tcp_bbr\n%s\nnf_conntrack\n' "$qmod" | opt_run tee /etc/modules-load.d/bbr-cake.conf >/dev/null
-  msg "$(c_grn "[✓] Автозагрузка модулей: /etc/modules-load.d/bbr-cake.conf (tcp_bbr, $qmod, nf_conntrack).")"
-
-  if [[ -f /etc/sysctl.d/99-reshala-boost.conf ]]; then
-    opt_run rm -f /etc/sysctl.d/99-reshala-boost.conf
-    msg "$(c_grn '[✓] Старый конфиг 99-reshala-boost.conf удалён (настройки перенесены).')"
-  fi
-
-  # --- 2. устранение конфликтов ---
-  if [[ -f /etc/sysctl.conf ]]; then
-    opt_run sed -i -E \
-      -e 's/^([[:space:]]*)(net\.core\.default_qdisc[[:space:]]*=.*)/# \2/' \
-      -e 's/^([[:space:]]*)(net\.ipv4\.tcp_congestion_control[[:space:]]*=.*)/# \2/' \
-      /etc/sysctl.conf 2>/dev/null
-    msg "$(c_grn '[✓] Конфликтующие строки в /etc/sysctl.conf закомментированы (если были).')"
-  fi
-
-  local f
-  for f in /etc/sysctl.d/*.conf; do
-    [[ -f "$f" ]] || continue
-    [[ "$(basename "$f")" == "99-zz-bbr-cake.conf" ]] && continue
-    grep -qE '^[[:space:]]*(net\.core\.default_qdisc|net\.ipv4\.tcp_congestion_control)[[:space:]]*=' "$f" 2>/dev/null || continue
-
-    local f_qdisc f_cc other_lines
-    f_qdisc=$(grep -E '^[[:space:]]*net\.core\.default_qdisc[[:space:]]*=' "$f" | tail -n1 | sed -E 's/.*=[[:space:]]*//')
-    f_cc=$(grep -E '^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]]*=' "$f" | tail -n1 | sed -E 's/.*=[[:space:]]*//')
-    other_lines=$(grep -vE '^[[:space:]]*(#|$|net\.core\.default_qdisc|net\.ipv4\.tcp_congestion_control)' "$f")
-
-    if [[ "$f_qdisc" == "$qdisc" && "$f_cc" == "bbr" && -z "$other_lines" ]]; then
-      opt_run rm -f "$f"
-      msg "$(c_grn "[✓] Удалён старый дублирующий конфиг: $f (совпадает с текущим).")"
-    else
-      msg "$(c_yel "[!] Конфликтующий файл с другими настройками: $f — проверь вручную.")"
-    fi
-  done
-
-  # --- 3. применение без ребута ---
-  msg "$(c_yel '[*] Загружаю модули ядра...')"
-  opt_run modprobe tcp_bbr 2>/dev/null
-  opt_run modprobe "$qmod" 2>/dev/null
-  opt_run modprobe nf_conntrack 2>/dev/null
-
-  msg "$(c_yel '[*] Применяю sysctl --system...')"
-  if ! opt_run sysctl --system >/dev/null 2>&1; then
-    msg "$(c_red '[!] sysctl недоступен на запись (OpenVZ/LXC?) — настройки сохранены в файлах, но не применены к текущему ядру.')"
-    return 1
-  fi
-  msg "$(c_grn '[✓] sysctl применён.')"
-
-  local iface
-  iface=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
-  if [[ -z "$iface" ]]; then
-    msg "$(c_yel '[!] Не удалось определить интерфейс по умолчанию (ip route) — qdisc применится после ребута.')"
-  else
-    msg "$(c_yel "[*] Применяю qdisc $qdisc на интерфейсе $iface (tc qdisc replace)...")"
-    if opt_run tc qdisc replace dev "$iface" root "$qdisc" 2>/dev/null; then
-      msg "$(c_grn "[✓] $qdisc активен на $iface.")"
-    else
-      msg "$(c_yel "[!] tc qdisc replace не сработал на $iface (виртуальный интерфейс?) — применится после ребута.")"
-    fi
-  fi
-
-  # --- 4. контроль ---
-  msg ""
-  msg "$(c_cyn '[*] Контроль:')"
-  opt_run sysctl net.core.default_qdisc net.ipv4.tcp_congestion_control 2>/dev/null \
-    | while IFS= read -r l; do msg "  $l"; done
-  if [[ -n "$iface" ]]; then
-    tc qdisc show dev "$iface" 2>/dev/null | while IFS= read -r l; do msg "  $l"; done
-    msg "$(c_cyn '[i] "qdisc mq root" с cake на дочерних очередях (parent :1, :2, ...) — норма для multi-queue сетевух, не ошибка.')"
-  fi
-}
-
-# ----------------------------------------------------------------------------
-# 1c. СЕТЕВЫЕ ЛИМИТЫ (tier по RAM): conntrack, somaxconn, backlog, file-max
-# ----------------------------------------------------------------------------
-opt_node_limits(){
-  msg ""
-  msg "$(c_cyn '─── Сетевые лимиты (tier по RAM) ───')"
-
-  local ram_mb
-  ram_mb=$(( $(grep MemTotal /proc/meminfo | awk '{print $2}') / 1024 ))
-
-  local tier conntrack_max somaxconn
-  if   [ "$ram_mb" -lt 2048 ]; then tier=1; conntrack_max=131072;  somaxconn=8192
-  elif [ "$ram_mb" -lt 4096 ]; then tier=2; conntrack_max=262144;  somaxconn=16384
-  elif [ "$ram_mb" -lt 8192 ]; then tier=3; conntrack_max=524288;  somaxconn=32768
-  else                              tier=4; conntrack_max=1048576; somaxconn=65535
-  fi
-
-  msg "$(c_cyn "[i] RAM: ${ram_mb} MB → tier ${tier} (conntrack ${conntrack_max}, somaxconn ${somaxconn})")"
-
-  local -a lines=(
-    "net.core.somaxconn = ${somaxconn}"
-    "net.ipv4.tcp_max_syn_backlog = ${somaxconn}"
-    "net.core.netdev_max_backlog = 16384"
-    "net.core.netdev_budget = 600"
-    "net.ipv4.tcp_syncookies = 1"
-    "net.ipv4.conf.all.rp_filter = 2"
-    "net.ipv4.conf.default.rp_filter = 2"
-    "net.ipv4.tcp_ecn = 2"
-    "fs.file-max = 1048576"
-  )
-
-  local have_conntrack=0
-  if [ -f /proc/sys/net/netfilter/nf_conntrack_max ]; then
-    have_conntrack=1
-    lines+=("net.netfilter.nf_conntrack_max = ${conntrack_max}")
-  else
-    msg "$(c_cyn '[i] conntrack не используется — лимит пропущен.')"
-  fi
-
-  printf '%s\n' "${lines[@]}" | opt_run tee /etc/sysctl.d/99-zz-node-limits.conf >/dev/null
-  msg "$(c_grn '[✓] Записан /etc/sysctl.d/99-zz-node-limits.conf.')"
-
-  # root не матчится маской "*" в pam_limits — прописываем отдельно
-  printf '%s\n' \
-    "* soft nofile 1048576" \
-    "* hard nofile 1048576" \
-    "root soft nofile 1048576" \
-    "root hard nofile 1048576" \
-    | opt_run tee /etc/security/limits.d/99-node.conf >/dev/null
-  msg "$(c_grn '[✓] Записан /etc/security/limits.d/99-node.conf (nofile 1048576, включая root).')"
-
-  msg "$(c_yel '[*] Применяю sysctl --system...')"
-  if ! opt_run sysctl --system >/dev/null 2>&1; then
-    msg "$(c_yel '[!] sysctl недоступен на запись (OpenVZ/LXC?) — настройки сохранены в файлах, но не применены к текущему ядру.')"
-  else
-    msg "$(c_grn '[✓] sysctl применён.')"
-  fi
-
-  msg ""
-  msg "$(c_cyn '[*] Контроль:')"
-  local -a ctl_keys=(net.core.somaxconn)
-  [[ "$have_conntrack" -eq 1 ]] && ctl_keys+=(net.netfilter.nf_conntrack_max)
-  ctl_keys+=(fs.file-max)
-  opt_run sysctl "${ctl_keys[@]}" 2>/dev/null | while IFS= read -r l; do msg "  $l"; done
-  msg "$(c_cyn '[i] ulimit -n обновится в новой сессии (релогин/ребут).')"
-}
 
 # ----------------------------------------------------------------------------
 # 2. ЛИМИТЫ RAM ДЛЯ remnanode (docker-compose)
@@ -1309,46 +950,842 @@ fix_and_update(){
   fi
 }
 
-# ----------------------------------------------------------------------------
-# 3. РОТАЦИЯ ЛОГОВ journald
-# ----------------------------------------------------------------------------
-opt_log_rotation(){
-  msg "$(c_cyn '─── Ротация логов journald ───')"
-  local jcfg="/etc/systemd/journald.conf"
-  if [[ -f "$jcfg" ]]; then
-    opt_run sed -i \
-      -e 's/^#\?SystemMaxUse=.*/SystemMaxUse=200M/' \
-      -e 's/^#\?RuntimeMaxUse=.*/RuntimeMaxUse=50M/' \
-      "$jcfg"
-    grep -q '^SystemMaxUse='  "$jcfg" || echo 'SystemMaxUse=200M'  | opt_run tee -a "$jcfg" >/dev/null
-    grep -q '^RuntimeMaxUse=' "$jcfg" || echo 'RuntimeMaxUse=50M'  | opt_run tee -a "$jcfg" >/dev/null
-    opt_run systemctl restart systemd-journald 2>/dev/null || true
-    msg "$(c_grn '[✓] journald: SystemMaxUse=200M, RuntimeMaxUse=50M.')"
-  else
-    msg "$(c_yel '[!] /etc/systemd/journald.conf не найден — пропускаю.')"
+# =========================== МОДУЛЬ: ОПТИМИЗАЦИЯ И ЗАЩИТА НОДЫ =============
+# warp-rules сам больше не оптимизирует хост — это обёртка эксплуатации над
+# сторонним node-accelerator (github.com/jestivald/node-accelerator, эталон —
+# именно апстрим). node-accelerator запускается ОТДЕЛЬНЫМ процессом (download
+# install.sh во временный файл + `bash tmp модуль`), а не сорсится функциями:
+# у него свой `set -euo pipefail` и IFS, которые здесь ломали бы меню (8.1 ТЗ).
+
+NA_REF="${NA_REF:-v3.9.2}"
+NA_REPO_URL="${NA_REPO_URL:-https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF}"
+NA_REQUIRE_SIG="${NA_REQUIRE_SIG:-1}"
+NA_MINISIGN_PUBKEY="${NA_MINISIGN_PUBKEY:-RWQrJghT9nkdBC3ntiEXF29zrS8o429WhObHKq6I7CKoftVDhQBrBscu}"
+NA_CONF_DIR=/etc/node-accelerator
+NA_STATE_DIR=/var/lib/node-accelerator
+WR_HARDEN_ENV=/etc/warp-rules/harden.env
+WR_BACKUP_ROOT=/var/backups/warp-rules
+# гео-блок — бизнес-решение донора, не хардинг; список стран вынесен в параметр
+NA_GEOBLOCK_COUNTRIES_DEFAULT="tw,in,bd,vn,id,ph,ir,pk,th,mm,kh,la,ng,eg,ke,tz,et,br,ve,ec"
+NA_MIN_CUSTOM_BLOCKLIST_CIDRS=1000
+# коммит shadow-netlab/traffic-guard-lists, проверен вручную перед переносом (раздел 4.2 ТЗ)
+NA_SCANLIST_REF="${NA_SCANLIST_REF:-aa4c79a665007bc6df00f53c0622cd9fa8aaef81}"
+
+# ключи node-accelerator, которые warp-rules передаёт через ENV (см. 6.3.4 ТЗ)
+NA_UPSTREAM_KEYS=(SSH_PORT TCP_PORTS UDP_PORTS NODE_PORT WHITELIST SAFETY_DELAY \
+                  ENABLE_BLOCKLISTS BLOCK_TOR ENABLE_CTGUARD \
+                  ENABLE_XANMOD QDISC REMNAWAVE_SWAP_SIZE)
+# свои ключи (не из node-accelerator) — тоже хранятся в harden.env
+WR_OWN_KEYS=(NA_GEOBLOCK_COUNTRIES REMOVE_LEGACY_FIREWALL)
+NA_ENV_KEYS=("${NA_UPSTREAM_KEYS[@]}" "${WR_OWN_KEYS[@]}")
+
+na_require_root(){ [[ $EUID -eq 0 ]] || { msg "$(c_red '[!] Нужен root: перезапусти через sudo (node-accelerator работает только от root).')"; return 1; }; }
+
+# na_get <conf-файл> <KEY> — эффективное значение node-accelerator. Формат
+# protect.conf/optimize.conf — не KEY=value, идиома `: "${KEY:=val}"`
+# (присваивает, только если KEY ещё не задан) — grep '^KEY=' её не поймёт,
+# нужен сорсинг в субшелле с предварительным unset (см. 1.3 ТЗ).
+na_get(){
+  local f="$1" k="$2"
+  [[ -f "$f" ]] || return 0
+  # shellcheck disable=SC1090  # путь заведомо динамический (protect.conf/optimize.conf на ноде)
+  ( unset "$k"; . "$f" 2>/dev/null; printf '%s' "${!k-}" )
+}
+
+# «заявленные владельцем» параметры (то, что мы передаём в ENV при каждом apply) —
+# отдельно от protect.conf/optimize.conf, чтобы видеть расхождение (5.3 ТЗ)
+# shellcheck disable=SC1090  # путь заведомо динамический (harden.env владельца)
+na_load_env(){ [[ -f "$WR_HARDEN_ENV" ]] && . "$WR_HARDEN_ENV" 2>/dev/null; return 0; }
+
+na_save_env(){
+  install -d -m 0700 "$(dirname "$WR_HARDEN_ENV")" 2>/dev/null
+  local tmp k v; tmp="$(mktemp)"
+  {
+    printf '# warp-rules — заявленные параметры node-accelerator (%s)\n' "$(date -Is)"
+    printf '# фактически применённое: /etc/node-accelerator/{protect,optimize}.conf\n'
+    for k in "${NA_ENV_KEYS[@]}"; do
+      v="${!k-}"
+      [[ -n "$v" ]] && printf '%s=%q\n' "$k" "$v"
+    done
+  } > "$tmp"
+  install -m 0600 "$tmp" "$WR_HARDEN_ENV"
+  rm -f "$tmp"
+}
+
+# na_set_param KEY VALUE — обновить один ключ в harden.env, не потеряв остальные
+na_conf_file_for_key(){
+  case "$1" in
+    ENABLE_XANMOD|QDISC|REMNAWAVE_SWAP_SIZE) printf '%s' "$NA_CONF_DIR/optimize.conf" ;;
+    *) printf '%s' "$NA_CONF_DIR/protect.conf" ;;
+  esac
+}
+
+# Убрать ключ из protect.conf/optimize.conf насовсем. Нужен для очистки: пустой
+# ENV НЕ очищает сохранённое значение — идиома `: "${KEY:=val}"` не отличает
+# "пусто" от "не задано", поэтому load_conf снова подставит старое значение.
+# Без этого снятие последнего whitelist-IP или закрытие всех портов молча не
+# применится (protect.sh отработает "успешно", список останется прежним).
+na_conf_unset(){
+  local f="$1" k="$2" tmp line prefix
+  [[ -f "$f" ]] || return 0
+  # shellcheck disable=SC2016  # одинарные кавычки нужны: $/{ должны остаться литералом для printf, не раскрыться в shell
+  printf -v prefix ': "${%s:=' "$k"
+  tmp="$(mktemp)"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" == "$prefix"* ]] && continue
+    printf '%s\n' "$line"
+  done < "$f" > "$tmp"
+  install -m 0600 "$tmp" "$f"
+  rm -f "$tmp"
+}
+
+na_set_param(){
+  local key="$1" val="$2"
+  na_load_env
+  printf -v "$key" '%s' "$val"
+  na_save_env
+  if [[ -z "$val" ]] && in_list "$key" "${NA_UPSTREAM_KEYS[@]}"; then
+    na_conf_unset "$(na_conf_file_for_key "$key")" "$key"
+    msg "$(c_yel "[i] $key снят из $(na_conf_file_for_key "$key") — apply применит пустое значение, а не старое.")"
   fi
 }
 
-# ----------------------------------------------------------------------------
-# МЕНЮ МОДУЛЯ "ОПТИМИЗАЦИЯ"
-# ----------------------------------------------------------------------------
-mode_optimization(){
+na_installed(){ [[ -d "$NA_CONF_DIR" ]]; }
+
+# nод-accelerator v3.9.2 уже персистит этот маркер сам (optimize.sh, $STATE_DIR/optimize.installed) —
+# свой маркер поверх писать не нужно, читаем готовый (см. отчёт: расхождение с 1.3/4.5 ТЗ)
+na_reboot_needed(){ grep -q '^reboot_needed=1' "$NA_STATE_DIR/optimize.installed" 2>/dev/null; }
+
+na_safety_armed(){
+  systemctl is-active --quiet na-fw-safety.timer 2>/dev/null && return 0
+  [[ -f "$NA_STATE_DIR/na-fw-safety.pid" ]] && kill -0 "$(cat "$NA_STATE_DIR/na-fw-safety.pid" 2>/dev/null)" 2>/dev/null
+}
+
+na_safety_remaining_s(){
+  # systemd-run --on-active создаёт МОНОТОННЫЙ таймер (относительно аптайма,
+  # не календаря) — NextElapseUSecRealtime у него всегда n/a, нужен Monotonic
+  # + текущий монотонный момент из /proc/uptime.
+  local next_us uptime_s now_us diff
+  next_us="$(systemctl show na-fw-safety.timer -p NextElapseUSecMonotonic --value 2>/dev/null)"
+  [[ "$next_us" =~ ^[0-9]+$ && "$next_us" -gt 0 ]] || return 1
+  uptime_s="$(awk '{print $1}' /proc/uptime 2>/dev/null)"
+  [[ -n "$uptime_s" ]] || return 1
+  now_us="$(awk -v u="$uptime_s" 'BEGIN{printf "%.0f", u*1000000}')"
+  diff=$(( next_us - now_us ))
+  (( diff > 0 )) && echo $(( diff / 1000000 )) || echo 0
+}
+
+# дешёвая шапка статуса для главного меню (6.1 ТЗ) — только если node-accelerator
+# вообще применялся; только nft/systemctl/чтение файла, без docker и без sleep
+na_header_lines(){
+  na_installed || return 0
+  local kern qdisc reb fw crowd saf secs
+  kern="$(uname -r)"; qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null)"
+  if na_reboot_needed; then reb="$(c_red 'ТРЕБУЕТСЯ РЕБУТ')"; else reb="ребут не требуется"; fi
+  msg "  $(c_yel 'Ядро:') $(c_grn "$kern") · qdisc ${qdisc:-?} · $reb"
+  nft list table inet na_filter >/dev/null 2>&1 && fw="$(c_grn 'na_filter активен')" || fw="$(c_red 'na_filter отсутствует')"
+  systemctl is-active --quiet crowdsec 2>/dev/null && crowd="$(c_grn 'CrowdSec ok')" || crowd="$(c_yel 'CrowdSec —')"
+  if na_safety_armed; then
+    secs="$(na_safety_remaining_s 2>/dev/null)"
+    saf="$(c_red "авто-откат ВЗВЕДЁН${secs:+, осталось ${secs}с}")"
+  else
+    saf="авто-откат снят"
+  fi
+  msg "  $(c_yel 'Защита:') $fw · $crowd · $saf"
+}
+
+# ── валидация ввода (whitelist/порты уходят в nft-heredoc — мусор нельзя) ──
+na_valid_ipcidr(){
+  local v="$1"
+  [[ -n "$v" ]] || return 1
+  # без точки/двоеточия это не IPv4/IPv6 — иначе чистый hex ("abc", "dead") проходил
+  # бы как «валидный» через класс символов [0-9a-fA-F:.]
+  [[ "$v" == *.* || "$v" == *:* ]] || return 1
+  [[ "$v" =~ ^[0-9a-fA-F:.]+(/[0-9]{1,3})?$ ]] || return 1
+  if [[ "$v" == *.* && "$v" != *:* ]]; then
+    local ip="${v%%/*}" o
+    IFS='.' read -ra o <<<"$ip"
+    [[ ${#o[@]} -eq 4 ]] || return 1
+    local n
+    for n in "${o[@]}"; do
+      [[ "$n" =~ ^[0-9]{1,3}$ ]] || return 1
+      (( 10#$n <= 255 )) || return 1
+    done
+  fi
+  return 0
+}
+
+na_validate_whitelist(){
+  local list="$1" v
+  [[ -n "$list" ]] || return 1
+  local -a items; IFS=',' read -ra items <<<"$list"
+  for v in "${items[@]}"; do
+    v="${v// /}"; [[ -n "$v" ]] || continue
+    na_valid_ipcidr "$v" || return 1
+  done
+  return 0
+}
+
+na_validate_ports(){
+  local list="$1" v
+  [[ -n "$list" ]] || return 1
+  local -a items; IFS=',' read -ra items <<<"$list"
+  for v in "${items[@]}"; do
+    [[ "$v" =~ ^[0-9]{1,5}$ ]] || return 1
+    (( 10#$v >= 1 && 10#$v <= 65535 )) || return 1
+  done
+  return 0
+}
+
+# снапшот шире, чем rollback node-accelerator (тот откатывает только своё) —
+# фиксирует ЧУЖИЕ правила, которые были до всего (4.4 ТЗ)
+na_snapshot(){
+  local ts dir; ts="$(date -u +%Y%m%dT%H%M%SZ)"; dir="$WR_BACKUP_ROOT/$ts"
+  install -d -m 0700 "$dir"
+  nft list ruleset >"$dir/nft.ruleset" 2>/dev/null || true
+  iptables-save >"$dir/iptables.rules" 2>/dev/null || true
+  ip6tables-save >"$dir/ip6tables.rules" 2>/dev/null || true
+  systemctl list-unit-files 'na-*' --no-legend >"$dir/na-units.txt" 2>/dev/null || true
+  systemctl status crowdsec crowdsec-firewall-bouncer --no-pager >"$dir/crowdsec-status.txt" 2>&1 || true
+  [[ -f "$NA_CONF_DIR/custom-blocklist.txt" ]] && cp -a "$NA_CONF_DIR/custom-blocklist.txt" "$dir/custom-blocklist.txt" 2>/dev/null
+  msg "$(c_grn "[✓] Снапшот: $dir")"
+}
+
+# apt.conf.d force-confold на время прогона — иначе dpkg виснет на вопросе о
+# конфигах в неинтерактивном режиме (4.6 ТЗ); снимается через trap RETURN
+NA_APT_CONFOLD_FILE=/etc/apt/apt.conf.d/99-warp-rules-hardening
+na_apt_confold_on(){ printf '%s\n' 'Dpkg::Options { "--force-confdef"; "--force-confold"; }' > "$NA_APT_CONFOLD_FILE"; }
+na_apt_confold_off(){ rm -f "$NA_APT_CONFOLD_FILE"; }
+
+# NA_REQUIRE_SIG=1 проверяет подписи ВСЕХ модулей node-accelerator (install.sh
+# сверяет .minisig на lib/common.sh, optimize.sh, protect.sh, diagnose.sh,
+# na-report.sh, rollback.sh) — это штатный механизм апстрима, шире, чем
+# SHA256 одного install.sh у донора (5.2 ТЗ). Нужен бинарь minisign.
+na_ensure_minisign(){
+  [[ "$NA_REQUIRE_SIG" == 1 ]] || return 0
+  command -v minisign >/dev/null 2>&1 && return 0
+  msg "$(c_yel '[*] Устанавливаю minisign (для проверки подписей node-accelerator)...')"
+  apt-get update -qq 2>/dev/null || true
+  apt-get install -y -qq minisign >/dev/null 2>&1 && return 0
+  msg "$(c_red '[!] Не удалось поставить minisign — проверка подписи невозможна.')"
+  msg "$(c_yel '    Поставь пакет вручную либо временно ослабь: NA_REQUIRE_SIG=0.')"
+  return 1
+}
+
+na_download_install(){
+  local dest="$1"
+  curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 60 \
+    "$NA_REPO_URL/install.sh" -o "$dest" \
+    || { msg "$(c_red "[!] Не удалось скачать install.sh из $NA_REPO_URL")"; return 1; }
+  chmod 0700 "$dest"
+}
+
+# если WHITELIST пуст — спросить IP панели (иначе она рискует остаться без
+# admin-доступа к порту ноды при первом же protect); пусто = продолжить на свой риск
+na_ensure_whitelist(){
+  na_load_env
+  local cur="${WHITELIST:-}"
+  [[ -z "$cur" ]] && cur="$(na_get "$NA_CONF_DIR/protect.conf" WHITELIST)"
+  [[ -n "$cur" ]] && return 0
+  msg "$(c_yel '[!] WHITELIST пуст. Без IP панели/мониторинга при первом apply есть риск не достучаться до порта ноды.')"
+  printf '%s' "$(c_yel '[?] IP/CIDR панели через запятую (Enter — пропустить на свой риск): ')" >&2
+  local ans; read -r ans < /dev/tty 2>/dev/null
+  if [[ -n "$ans" ]]; then
+    if ! na_validate_whitelist "$ans"; then
+      msg "$(c_red '[!] Некорректный формат IP/CIDR — apply отменён.')"
+      return 1
+    fi
+    WHITELIST="$ans"
+  else
+    msg "$(c_yel '[i] Продолжаю без WHITELIST.')"
+  fi
+  return 0
+}
+
+# ── применить: optimize|protect|all — отдельным процессом (8.1 ТЗ) ──
+# 99-zz-bbr-cake.conf / 99-zz-node-limits.conf — конфиги старых модулей
+# warp-rules (уже удалённых). Сортируются ПОСЛЕ 99-node-accelerator.conf
+# ("n" < "z") и молча перебивают его тюнинг без единого сообщения — снести
+# нужно ДО первого apply optimize, иначе конфликт останется (владелец решил:
+# сносить сразу, а не отдельным шагом).
+na_cleanup_legacy_sysctl(){
+  local f found=0
+  for f in /etc/sysctl.d/99-zz-bbr-cake.conf /etc/sysctl.d/99-zz-node-limits.conf \
+           /etc/modules-load.d/bbr-cake.conf /etc/security/limits.d/99-node.conf; do
+    [[ -f "$f" ]] && { rm -f "$f"; found=1; }
+  done
+  [[ "$found" -eq 1 ]] || return 0
+  msg "$(c_grn '[✓] Старые конфиги warp-rules (99-zz-bbr-cake.conf, 99-zz-node-limits.conf) удалены — не будут перебивать тюнинг node-accelerator.')"
+  sysctl --system >/dev/null 2>&1 || true
+}
+
+na_apply(){
+  local mode="$1"
+  na_require_root || return 1
+  if [[ "$mode" == protect || "$mode" == all ]]; then
+    na_ensure_whitelist || return 1
+  fi
+  na_snapshot
+  [[ "$mode" == optimize || "$mode" == all ]] && na_cleanup_legacy_sysctl
+
+  local tmp; tmp="$(mktemp)"
+  na_download_install "$tmp" || { rm -f "$tmp"; return 1; }
+
+  na_apt_confold_on
+  trap 'na_apt_confold_off' RETURN
+
+  if [[ "$NA_REQUIRE_SIG" == 1 ]]; then
+    na_ensure_minisign || { rm -f "$tmp"; return 1; }
+  fi
+
+  na_load_env
+  local -a envp=(NA_REF="$NA_REF" NA_REPO_URL="$NA_REPO_URL" NA_REQUIRE_SIG="$NA_REQUIRE_SIG" \
+                 NA_MINISIGN_PUBKEY="$NA_MINISIGN_PUBKEY" REMNAWAVE_NONINTERACTIVE=1)
+  local k v
+  for k in "${NA_UPSTREAM_KEYS[@]}"; do
+    v="${!k-}"
+    [[ -n "$v" ]] && envp+=("$k=$v")
+  done
+
+  msg "$(c_cyn "[*] Запускаю node-accelerator $mode ($NA_REF)...")"
+  env "${envp[@]}" bash "$tmp" "$mode"
+  local rc=$?
+  rm -f "$tmp"
+
+  if [[ $rc -eq 0 ]]; then
+    na_save_env
+    if [[ "$mode" == protect || "$mode" == all ]]; then
+      na_configure_crowdsec_remnawave
+      na_write_blocklist_updater
+      msg ""
+      msg "$(c_red "[!] Сейфти-таймер взведён (${SAFETY_DELAY:-900}с). Проверь SSH и HTTPS из ОТДЕЛЬНОЙ сессии, затем пункт «Подтвердить доступ».")"
+    fi
+    if [[ "$mode" == optimize || "$mode" == all ]] && na_reboot_needed; then
+      msg "$(c_yel '[!] Установлено новое ядро XanMod — нужна перезагрузка (reboot), чтобы BBRv3 заработал.')"
+    fi
+  else
+    msg "$(c_red "[!] node-accelerator $mode завершился с ошибкой (код $rc).")"
+  fi
+  return $rc
+}
+
+# ── подтверждение доступа (два действия donor'а: systemd-таймер И nohup+pid,
+# у node-accelerator есть оба — снимать нужно оба, см. 4.1 ТЗ) ──
+na_confirm(){
+  na_require_root || return 1
+  if ! na_safety_armed; then
+    msg "$(c_grn '[✓] Авто-откат не взведён — подтверждать нечего.')"
+    return 0
+  fi
+  systemctl stop na-fw-safety.service na-fw-safety.timer 2>/dev/null || true
+  local pidf="$NA_STATE_DIR/na-fw-safety.pid"
+  if [[ -f "$pidf" ]]; then
+    kill "$(cat "$pidf" 2>/dev/null)" 2>/dev/null || true
+    rm -f "$pidf"
+  fi
+  if na_safety_armed; then
+    msg "$(c_red '[!] Не удалось снять авто-откат — таймер или процесс всё ещё активны.')"
+    return 1
+  fi
+  msg "$(c_grn '[✓] Авто-откат снят. Защита активна на постоянной основе.')"
+}
+
+# ── CrowdSec: привязка к remnawave-nginx (без этого CrowdSec работает вхолостую) ──
+na_configure_crowdsec_remnawave(){
+  local nginx_container
+  nginx_container="$(docker ps --format '{{.Names}}' 2>/dev/null | awk '$0 == "remnawave-nginx" {print; exit}')"
+  if [[ -z "$nginx_container" ]]; then
+    msg "$(c_yel '[i] Контейнер remnawave-nginx не найден — привязка CrowdSec к его логам пропущена.')"
+    return 0
+  fi
+  command -v cscli >/dev/null 2>&1 || { msg "$(c_yel '[i] CrowdSec ещё не установлен — привязка выполнится позже.')"; return 0; }
+
+  install -d -m 0755 /etc/crowdsec/acquis.d /etc/systemd/system/crowdsec.service.d
+  local tmp; tmp="$(mktemp)"
+  cat > "$tmp" <<EOF
+---
+source: docker
+container_name:
+  - $nginx_container
+labels:
+  type: nginx
+EOF
+  mv -f "$tmp" /etc/crowdsec/acquis.d/remnawave-nginx-docker.yaml
+  # старый инсталлятор мог класть nginx-docker.yaml — снести только при побайтовом совпадении
+  if [[ -f /etc/crowdsec/acquis.d/nginx-docker.yaml ]] \
+     && cmp -s /etc/crowdsec/acquis.d/remnawave-nginx-docker.yaml /etc/crowdsec/acquis.d/nginx-docker.yaml; then
+    rm -f /etc/crowdsec/acquis.d/nginx-docker.yaml
+  fi
+
+  tmp="$(mktemp)"
+  cat > "$tmp" <<'EOF'
+[Service]
+Environment=GOGC=20
+Environment=GOMAXPROCS=1
+EOF
+  mv -f "$tmp" /etc/systemd/system/crowdsec.service.d/remnawave-limits.conf
+
+  cscli collections install crowdsecurity/nginx >/dev/null 2>&1
+  local scenario
+  for scenario in http-wordpress-scan http-magento-scan http-phpmyadmin-scan http-thinkphp-scan; do
+    cscli scenarios remove "crowdsecurity/$scenario" >/dev/null 2>&1 || true
+  done
+
+  systemctl daemon-reload
+  systemctl restart crowdsec.service crowdsec-firewall-bouncer.service 2>/dev/null || true
+  msg "$(c_grn "[✓] CrowdSec привязан к логам $nginx_container (GOGC=20/GOMAXPROCS=1, коллекция nginx, шумные web-сценарии сняты).")"
+}
+
+# ── блоклист-апдейтер: скан/гео-списки → custom-blocklist.txt (штатная точка
+# расширения protect.sh) + systemd-таймер (4.2 ТЗ) ──
+na_write_blocklist_updater(){
+  na_load_env
+  local countries="${NA_GEOBLOCK_COUNTRIES:-$NA_GEOBLOCK_COUNTRIES_DEFAULT}"
+  local custom="$NA_CONF_DIR/custom-blocklist.txt"
+  local updater=/usr/local/sbin/remnawave-update-scanner-lists
+  install -d -m 0750 "$NA_CONF_DIR"
+
+  local tmp; tmp="$(mktemp)"
+  cat > "$tmp" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=\$'\n\t'
+umask 027
+
+CUSTOM_LIST='$custom'
+MIN_CIDRS='$NA_MIN_CUSTOM_BLOCKLIST_CIDRS'
+COUNTRIES='$countries'
+TG_REF='$NA_SCANLIST_REF'
+WORK=\$(mktemp -d /var/tmp/remnawave-blocklist.XXXXXX)
+trap 'rm -rf "\$WORK"' EXIT
+
+fetch() { curl --fail --silent --show-error --location --proto '=https' --connect-timeout 15 --max-time 90 --retry 3 --retry-delay 2 "\$1" -o "\$2"; }
+fetch "https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/\$TG_REF/public/antiscanner.list" "\$WORK/antiscanner.list" || true
+fetch "https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/\$TG_REF/public/government_networks.list" "\$WORK/government_networks.list" || true
+IFS=',' read -ra _countries <<<"\$COUNTRIES"
+for country in "\${_countries[@]}"; do
+  [[ -n "\$country" ]] || continue
+  fetch "https://www.ipdeny.com/ipblocks/data/countries/\${country}.zone" "\$WORK/\${country}.zone" || true
+done
+
+python3 - "\$WORK" "\$WORK/custom-blocklist.txt" "\$MIN_CIDRS" <<'PY'
+import ipaddress, pathlib, sys
+root, output, minimum = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), int(sys.argv[3])
+nets = []
+for path in root.glob('*'):
+    if path.name == output.name:
+        continue
+    for raw in path.read_text(encoding='utf-8', errors='ignore').splitlines():
+        value = raw.split('#', 1)[0].strip()
+        if not value:
+            continue
+        try:
+            net = ipaddress.ip_network(value, strict=False)
+        except ValueError:
+            continue
+        if net.version == 4:
+            nets.append(net)
+collapsed = list(ipaddress.collapse_addresses(nets))
+if len(collapsed) < minimum:
+    raise SystemExit(f'refusing replacement: only {len(collapsed)} IPv4 CIDRs, need {minimum}')
+output.write_text(''.join(f'{net}\n' for net in collapsed), encoding='ascii')
+PY
+
+test -s "\$WORK/custom-blocklist.txt"
+install -m 0644 "\$WORK/custom-blocklist.txt" "\$CUSTOM_LIST.new"
+mv -f "\$CUSTOM_LIST.new" "\$CUSTOM_LIST"
+if command -v /usr/local/sbin/na-blocklist-update >/dev/null 2>&1; then
+  /usr/local/sbin/na-blocklist-update 1
+else
+  systemctl start na-blocklist.service 2>/dev/null || true
+fi
+EOF
+  install -m 0750 "$tmp" "$updater"
+  rm -f "$tmp"
+
+  cat > /etc/systemd/system/remnawave-scanner-update.service <<EOF
+[Unit]
+Description=Refresh warp-rules scanner/geo block list (last-known-good)
+After=network-online.target na-firewall.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$updater
+EOF
+  cat > /etc/systemd/system/remnawave-scanner-update.timer <<'EOF'
+[Unit]
+Description=Daily refresh of warp-rules scanner/geo block list
+
+[Timer]
+OnCalendar=*-*-* 04:00:00 UTC
+Persistent=true
+RandomizedDelaySec=20m
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now remnawave-scanner-update.timer >/dev/null 2>&1
+  msg "$(c_grn '[✓] Блоклист-апдейтер установлен (таймер remnawave-scanner-update, 04:00 UTC).')"
+}
+
+# ── whitelist / порты ──
+na_whitelist_add(){
+  na_require_root || return 1
+  local cur new ip_input
+  cur="$(na_get "$NA_CONF_DIR/protect.conf" WHITELIST)"
+  if [[ -z "$cur" ]]; then na_load_env; cur="${WHITELIST:-}"; fi
+  msg "  Текущий whitelist: ${cur:-(пусто)}"
+  printf '%s' "$(c_yel '[?] IP/CIDR добавить (можно несколько через запятую): ')" >&2
+  read -r ip_input < /dev/tty 2>/dev/null
+  [[ -z "$ip_input" ]] && { msg "$(c_yel 'Отменено.')"; return 0; }
+  if ! na_validate_whitelist "$ip_input"; then msg "$(c_red '[!] Некорректный IP/CIDR — отменено.')"; return 1; fi
+  # добавляем по одному адресу — проверка «уже в списке» на всей строке разом
+  # пропускала бы дубликаты при вводе нескольких адресов через запятую
+  new="$cur"
+  local -a items; IFS=',' read -ra items <<<"$ip_input"
+  local added=0 e
+  for e in "${items[@]}"; do
+    e="${e// /}"; [[ -n "$e" ]] || continue
+    if [[ ",$new," == *",$e,"* ]]; then
+      msg "$(c_yel "[i] $e уже в списке.")"
+    else
+      new="${new:+$new,}$e"; added=1
+    fi
+  done
+  [[ "$added" -eq 1 ]] || { msg "$(c_yel '[i] Нечего добавлять.')"; return 0; }
+  na_set_param WHITELIST "$new"
+  msg "$(c_cyn '[*] Применяю через protect...')"
+  na_apply protect
+  msg "$(c_yel '[i] Не забудь «Подтвердить доступ» после проверки SSH/HTTPS.')"
+}
+
+na_whitelist_remove(){
+  na_require_root || return 1
+  local cur new e
+  cur="$(na_get "$NA_CONF_DIR/protect.conf" WHITELIST)"
+  if [[ -z "$cur" ]]; then na_load_env; cur="${WHITELIST:-}"; fi
+  if [[ -z "$cur" ]]; then msg "$(c_yel '[i] Whitelist пуст.')"; return 0; fi
+  msg "  Текущий whitelist: $cur"
+  printf '%s' "$(c_yel '[?] IP/CIDR убрать: ')" >&2
+  local ip; read -r ip < /dev/tty 2>/dev/null
+  [[ -z "$ip" ]] && { msg "$(c_yel 'Отменено.')"; return 0; }
+  if [[ ",$cur," != *",$ip,"* ]]; then msg "$(c_yel '[i] Такого адреса в списке нет.')"; return 0; fi
+  new=""
+  local -a items; IFS=',' read -ra items <<<"$cur"
+  for e in "${items[@]}"; do [[ "$e" == "$ip" ]] || new="${new:+$new,}$e"; done
+  na_set_param WHITELIST "$new"
+  na_apply protect
+  msg "$(c_yel '[i] Не забудь «Подтвердить доступ» после проверки SSH/HTTPS.')"
+}
+
+na_ports_edit(){
+  local action="$1" key p
+  msg "  1. TCP  2. UDP"
+  printf '%s' "$(c_yel '[?] Протокол (1/2): ')" >&2
+  read -r p < /dev/tty 2>/dev/null
+  case "$p" in 1) key=TCP_PORTS ;; 2) key=UDP_PORTS ;; *) msg "$(c_red 'Отмена.')"; return 1 ;; esac
+  local cur; cur="$(na_get "$NA_CONF_DIR/protect.conf" "$key")"
+  if [[ -z "$cur" ]]; then na_load_env; cur="${!key:-}"; fi
+  msg "  Текущие порты ($key): ${cur:-(пусто)}"
+  printf '%s' "$(c_yel "[?] Порт(ы) для действия «$action» (через запятую): ")" >&2
+  local ports; read -r ports < /dev/tty 2>/dev/null
+  if ! na_validate_ports "$ports"; then msg "$(c_red '[!] Некорректный список портов.')"; return 1; fi
+  local new pp
+  local -a req; IFS=',' read -ra req <<<"$ports"
+  if [[ "$action" == открыть ]]; then
+    new="$cur"
+    for pp in "${req[@]}"; do [[ ",$new," == *",$pp,"* ]] || new="${new:+$new,}$pp"; done
+  else
+    new=""
+    local -a cur_a; IFS=',' read -ra cur_a <<<"$cur"
+    for pp in "${cur_a[@]}"; do
+      [[ -n "$pp" ]] || continue
+      [[ ",$ports," == *",$pp,"* ]] || new="${new:+$new,}$pp"
+    done
+  fi
+  na_require_root || return 1
+  na_set_param "$key" "$new"
+  na_apply protect
+  msg "$(c_yel '[i] Не забудь «Подтвердить доступ» после проверки SSH/HTTPS.')"
+}
+
+# «пожарный» допуск — прямой nft add element, без ре-рана, до перезапуска na-firewall/ребута
+na_firewall_emergency_admit(){
+  na_installed || { msg "$(c_yel '[i] node-accelerator ещё не применялся.')"; return 1; }
+  na_require_root || return 1
+  printf '%s' "$(c_yel '[?] IP для пожарного допуска: ')" >&2
+  local ip; read -r ip < /dev/tty 2>/dev/null
+  na_valid_ipcidr "$ip" || { msg "$(c_red '[!] Некорректный IP/CIDR.')"; return 1; }
+  msg "  1. Ко всем портам (whitelist_v4/v6) — стоит выше всех лимитов"
+  msg "  2. Только к порту node-agent (na_nodeport_wl_*)"
+  printf '%s' "$(c_yel '[?] Куда (1/2): ')" >&2
+  local w set; read -r w < /dev/tty 2>/dev/null
+  if [[ "$w" == 2 ]]; then set=na_nodeport_wl; else set=whitelist; fi
+  [[ "$ip" == *:* ]] && set="${set}_v6" || set="${set}_v4"
+  if nft add element inet na_filter "$set" "{ $ip }" 2>/dev/null; then
+    msg "$(c_grn "[✓] $ip добавлен в $set (живёт до перезапуска na-firewall/ребута — не персистится).")"
+  else
+    msg "$(c_red '[!] Не удалось добавить элемент — есть ли живая na_filter?')"
+  fi
+}
+
+na_report_ip(){
+  command -v na-report >/dev/null 2>&1 || { msg "$(c_yel '[i] na-report ещё не установлен.')"; return 1; }
+  printf '%s' "$(c_yel '[?] IP (один адрес, без /CIDR-маски): ')" >&2
+  local ip; read -r ip < /dev/tty 2>/dev/null
+  if [[ "$ip" == */* ]]; then msg "$(c_red '[!] na-report --ip ожидает один адрес, а не CIDR-диапазон.')"; return 1; fi
+  na_valid_ipcidr "$ip" || { msg "$(c_red '[!] Некорректный IP.')"; return 1; }
+  na-report --ip "$ip"
+}
+
+na_menu_whitelist(){
+  while :; do
+    local wl tcp udp ssh
+    wl="$(na_get "$NA_CONF_DIR/protect.conf" WHITELIST)"
+    tcp="$(na_get "$NA_CONF_DIR/protect.conf" TCP_PORTS)"
+    udp="$(na_get "$NA_CONF_DIR/protect.conf" UDP_PORTS)"
+    ssh="$(na_get "$NA_CONF_DIR/protect.conf" SSH_PORT)"
+    msg ""
+    msg "  Whitelist: ${wl:-(пусто)}"
+    msg "  TCP: ${tcp:-?}    UDP: ${udp:-—}    SSH: ${ssh:-авто}"
+    msg "  ─────────────────────────────────────"
+    msg "  1. Показать кандидатов (na-fw-top-talkers)"
+    msg "  2. Добавить IP/CIDR в whitelist"
+    msg "  3. Убрать IP/CIDR из whitelist"
+    msg "  4. Открыть порт (TCP/UDP)"
+    msg "  5. Закрыть порт"
+    msg "  6. Пожарный допуск (без ре-рана, до перезапуска)"
+    msg "  7. Проверить IP (na-report --ip)"
+    msg "  0. Назад"
+    printf '%s' "$(c_yel '[?] Выбор (0-7): ')" >&2
+    local c; read -r c < /dev/tty 2>/dev/null || return 1
+    case "$c" in
+      1) if command -v na-fw-top-talkers >/dev/null 2>&1; then na-fw-top-talkers; else msg "$(c_yel '[i] Ещё не установлено.')"; fi ;;
+      2) na_whitelist_add ;;
+      3) na_whitelist_remove ;;
+      4) na_ports_edit открыть ;;
+      5) na_ports_edit закрыть ;;
+      6) na_firewall_emergency_admit ;;
+      7) na_report_ip ;;
+      0) return 0 ;;
+      *) msg "$(c_red 'Неверный выбор, повтори.')" ;;
+    esac
+  done
+}
+
+na_menu_params(){
+  na_load_env
+  msg ""
+  msg "$(c_cyn '──── Параметры: заявлено (harden.env) → применено (node-accelerator) ────')"
+  local k declared actual f
+  for k in "${NA_UPSTREAM_KEYS[@]}"; do
+    declared="${!k:-—}"
+    f="$NA_CONF_DIR/protect.conf"
+    case "$k" in ENABLE_XANMOD|QDISC|REMNAWAVE_SWAP_SIZE) f="$NA_CONF_DIR/optimize.conf" ;; esac
+    actual="$(na_get "$f" "$k")"; actual="${actual:-—}"
+    msg "$(printf '  %-22s %-20s %s' "$k" "$declared" "$actual")"
+  done
+  for k in "${WR_OWN_KEYS[@]}"; do
+    declared="${!k:-—}"
+    msg "$(printf '  %-22s %-20s %s' "$k" "$declared" "(своё, не из node-accelerator)")"
+  done
+  msg ""
+  printf '%s' "$(c_yel '[?] Enter — назад, либо KEY=value чтобы задать (применится при следующем apply): ')" >&2
+  local line; read -r line < /dev/tty 2>/dev/null
+  [[ -z "$line" ]] && return 0
+  if [[ "$line" =~ ^([A-Z_]+)=(.*)$ ]]; then
+    local kk="${BASH_REMATCH[1]}" vv="${BASH_REMATCH[2]}"
+    if in_list "$kk" "${NA_ENV_KEYS[@]}"; then
+      na_require_root || return 1
+      na_set_param "$kk" "$vv"
+      msg "$(c_grn "[✓] $kk=$vv сохранено в $WR_HARDEN_ENV.")"
+    else
+      msg "$(c_red "[!] Неизвестный ключ: $kk")"
+    fi
+  else
+    msg "$(c_red '[!] Формат: KEY=value')"
+  fi
+}
+
+na_menu_status(){
   while :; do
     msg ""
-    msg "$(c_cyn '══════════  Оптимизация  ══════════')"
-    msg "  1. Полная оптимизация (ZRAM + Swap + BBR + CAKE + лимиты)"
-    msg "  2. Лимиты RAM для remnanode (docker-compose)"
-    msg "  3. Ротация логов journald"
-    msg "  4. Применить всё сразу"
+    msg "$(c_cyn '──── Статус и диагностика ────')"
+    msg "  1. Краткая сводка"
+    msg "  2. na-diagnose (полный health-отчёт)"
+    msg "  3. na-diagnose --json"
+    msg "  4. na-fw-status (баны, блоклисты, CrowdSec)"
+    msg "  5. na-report (форензика атак за 24ч)"
+    msg "  6. Список снапшотов правил"
     msg "  0. Назад"
-    msg "$(c_cyn '═══════════════════════════════════')"
-    printf '%s' "$(c_yel '[?] Выбор (0-4): ')" >&2
-    local choice; read -r choice < /dev/tty 2>/dev/null || return 1
-    case "$choice" in
-      1) opt_hybrid_memory; setup_bbr_cake; opt_node_limits ;;
-      2) opt_docker_limits ;;
-      3) opt_log_rotation ;;
-      4) opt_hybrid_memory; setup_bbr_cake; opt_node_limits; opt_docker_limits; opt_log_rotation ;;
+    printf '%s' "$(c_yel '[?] Выбор (0-6): ')" >&2
+    local c; read -r c < /dev/tty 2>/dev/null || return 1
+    case "$c" in
+      1) na_header_lines || msg "$(c_yel '[i] node-accelerator ещё не применялся.')" ;;
+      2) if command -v na-diagnose >/dev/null 2>&1; then na-diagnose; else msg "$(c_yel '[i] node-accelerator ещё не применялся.')"; fi ;;
+      3) if command -v na-diagnose >/dev/null 2>&1; then na-diagnose --json; else msg "$(c_yel '[i] node-accelerator ещё не применялся.')"; fi ;;
+      4) if command -v na-fw-status >/dev/null 2>&1; then na-fw-status; else msg "$(c_yel '[i] Ещё не установлено.')"; fi ;;
+      5) if command -v na-report >/dev/null 2>&1; then na-report; else msg "$(c_yel '[i] Ещё не установлено.')"; fi ;;
+      6) if [[ -d "$WR_BACKUP_ROOT" ]]; then ls -1 "$WR_BACKUP_ROOT" 2>/dev/null | while IFS= read -r l; do msg "  $l"; done
+         else msg "$(c_yel '[i] Снапшотов нет.')"; fi ;;
+      0) return 0 ;;
+      *) msg "$(c_red 'Неверный выбор, повтори.')" ;;
+    esac
+  done
+}
+
+# legacy ufw/iptables — по умолчанию НЕ трогаем (protect.sh намеренно живёт
+# рядом с чужими правилами). Флаш только INPUT (не FORWARD — там цепочки
+# Docker, донорский `iptables -F` без указания цепочки их вычищал, 5.1 ТЗ).
+na_remove_legacy_firewall(){
+  na_require_root || return 1
+  msg "$(c_yel '[!] Снятие legacy ufw/iptables. По умолчанию мы их не трогаем — убедись, что')"
+  msg "$(c_yel '    na_filter уже применена и SSH-доступ подтверждён (пункт «Подтвердить доступ»).')"
+  printf '%s' "$(c_yel '[?] Точно продолжить? Наберите YES: ')" >&2
+  local ans; read -r ans < /dev/tty 2>/dev/null
+  [[ "$ans" == "YES" ]] || { msg "$(c_yel 'Отменено.')"; return 0; }
+  na_snapshot
+  systemctl disable --now ufw.service 2>/dev/null || true
+  apt-get purge -y ufw >/dev/null 2>&1 || true
+  systemctl disable --now traffic-guard.service 2>/dev/null || true
+  rm -f /usr/local/bin/traffic-guard /etc/systemd/system/traffic-guard.service
+  systemctl daemon-reload
+  iptables -P INPUT ACCEPT 2>/dev/null || true
+  iptables -F INPUT 2>/dev/null || true
+  iptables -X SCANNERS-BLOCK 2>/dev/null || true
+  command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save || true
+  msg "$(c_grn '[✓] Legacy-цепочка INPUT очищена (FORWARD/Docker-цепочки не трогались).')"
+  if docker inspect remnanode >/dev/null 2>&1; then
+    msg "$(c_cyn '[*] Проверяю исходящую связность из remnanode...')"
+    if docker exec remnanode sh -c 'command -v curl >/dev/null 2>&1 && curl -fsS --max-time 5 https://1.1.1.1 >/dev/null' 2>/dev/null; then
+      msg "$(c_grn '[✓] Связность из remnanode подтверждена.')"
+    else
+      msg "$(c_yel '[!] Не удалось подтвердить связность из remnanode автоматически (нет curl в образе или сеть режется) — проверь вручную.')"
+    fi
+  fi
+}
+
+na_menu_maintenance(){
+  msg ""
+  msg "  1. Обновить блоклисты сейчас"
+  msg "  2. Лимиты RAM для remnanode (docker-compose)"
+  msg "  3. Убрать legacy-фаервол (ufw/iptables)"
+  msg "  0. Назад"
+  printf '%s' "$(c_yel '[?] Выбор (0-3): ')" >&2
+  local c; read -r c < /dev/tty 2>/dev/null || return 1
+  case "$c" in
+    1) na_require_root || return 1
+       if [[ -x /usr/local/sbin/remnawave-update-scanner-lists ]]; then
+         /usr/local/sbin/remnawave-update-scanner-lists && msg "$(c_grn '[✓] Блоклисты обновлены.')"
+       else
+         msg "$(c_yel '[i] Блоклист-апдейтер ещё не установлен — примени защиту (пункт 1 → 1 или 3).')"
+       fi ;;
+    2) opt_docker_limits ;;
+    3) na_remove_legacy_firewall ;;
+    0) return 0 ;;
+    *) msg "$(c_red 'Неверный выбор, повтори.')" ;;
+  esac
+}
+
+na_rollback(){
+  local what="$1"
+  na_require_root || return 1
+  msg "$(c_yel "[!] Откат node-accelerator: $what")"
+  printf '%s' "$(c_yel '[?] Точно? (y/N): ')" >&2
+  local ans; read -r ans < /dev/tty 2>/dev/null
+  [[ "$ans" =~ ^[yYдД]$ ]] || { msg "$(c_yel 'Отменено.')"; return 0; }
+  na_snapshot
+  local tmp; tmp="$(mktemp)"
+  na_download_install "$tmp" || { rm -f "$tmp"; return 1; }
+  env NA_REF="$NA_REF" NA_REPO_URL="$NA_REPO_URL" bash "$tmp" rollback "$what"
+  local rc=$?
+  rm -f "$tmp"
+  [[ $rc -eq 0 ]] && msg "$(c_grn "[✓] Откат ($what) выполнен.")"
+  return $rc
+}
+
+na_menu_rollback(){
+  msg ""
+  msg "  1. Откатить защиту (protect)"
+  msg "  2. Откатить оптимизацию (optimize)"
+  msg "  3. Откатить всё"
+  msg "  0. Назад"
+  printf '%s' "$(c_yel '[?] Выбор (0-3): ')" >&2
+  local c; read -r c < /dev/tty 2>/dev/null || return 1
+  case "$c" in
+    1) na_rollback protect ;;
+    2) na_rollback optimize ;;
+    3) na_rollback all ;;
+    0) return 0 ;;
+    *) msg "$(c_red 'Неверный выбор, повтори.')" ;;
+  esac
+}
+
+na_menu_apply(){
+  msg ""
+  msg "  1. Полностью (оптимизация + защита)"
+  msg "  2. Только оптимизация (ядро, sysctl, память, NIC)"
+  msg "  3. Только защита (nftables + CrowdSec + блоклисты)"
+  msg "  0. Назад"
+  printf '%s' "$(c_yel '[?] Выбор (0-3): ')" >&2
+  local c; read -r c < /dev/tty 2>/dev/null || return 1
+  case "$c" in
+    1) na_apply all ;;
+    2) na_apply optimize ;;
+    3) na_apply protect ;;
+    0) return 0 ;;
+    *) msg "$(c_red 'Неверный выбор, повтори.')" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# ПУНКТ МЕНЮ 4: «Оптимизация и защита ноды»
+# ---------------------------------------------------------------------------
+mode_na_hardening(){
+  na_require_root || return 1
+  while :; do
+    local kern qdisc swapsz fw crowd bouncer wl tcp udp ssh
+    msg ""
+    msg "$(c_cyn '──── Оптимизация и защита ноды ────')"
+    kern="$(uname -r)"; qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null)"
+    swapsz="$(na_get "$NA_CONF_DIR/optimize.conf" REMNAWAVE_SWAP_SIZE)"
+    msg "  Ядро:  $kern · qdisc ${qdisc:-?} · swap ${swapsz:-?}"
+    nft list table inet na_filter >/dev/null 2>&1 && fw="активен" || fw="нет"
+    systemctl is-active --quiet crowdsec 2>/dev/null && crowd="ok" || crowd="—"
+    systemctl is-active --quiet crowdsec-firewall-bouncer 2>/dev/null && bouncer="ok" || bouncer="—"
+    msg "  Сеть:  na_filter $fw · CrowdSec $crowd · bouncer $bouncer"
+    wl="$(na_get "$NA_CONF_DIR/protect.conf" WHITELIST)"
+    tcp="$(na_get "$NA_CONF_DIR/protect.conf" TCP_PORTS)"
+    udp="$(na_get "$NA_CONF_DIR/protect.conf" UDP_PORTS)"
+    ssh="$(na_get "$NA_CONF_DIR/protect.conf" SSH_PORT)"
+    msg "  Порты: TCP ${tcp:-?} · UDP ${udp:-—} · SSH ${ssh:-авто}"
+    if na_safety_armed; then
+      local secs; secs="$(na_safety_remaining_s 2>/dev/null)"
+      msg "  $(c_red "Авто-откат: ВЗВЕДЁН${secs:+, осталось ${secs}с}")"
+    else
+      msg "  Авто-откат: не взведён"
+    fi
+    msg "$(c_cyn '─────────────────────────────────────────────')"
+    msg "  1. Применить"
+    msg "  2. Подтвердить доступ (confirm)"
+    msg "  3. Белый список и порты"
+    msg "  4. Параметры"
+    msg "  5. Статус и диагностика"
+    msg "  6. Обслуживание"
+    msg "  7. Откат"
+    msg "  0. Назад"
+    printf '%s' "$(c_yel '[?] Выбор (0-7): ')" >&2
+    local c; read -r c < /dev/tty 2>/dev/null || return 1
+    case "$c" in
+      1) na_menu_apply ;;
+      2) na_confirm ;;
+      3) na_menu_whitelist ;;
+      4) na_menu_params ;;
+      5) na_menu_status ;;
+      6) na_menu_maintenance ;;
+      7) na_menu_rollback ;;
       0) return 0 ;;
       *) msg "$(c_red 'Неверный выбор, повтори.')" ;;
     esac
