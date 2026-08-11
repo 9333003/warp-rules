@@ -1703,7 +1703,11 @@ na_menu_whitelist(){
     udp="$(na_get "$NA_CONF_DIR/protect.conf" UDP_PORTS)"
     ssh="$(na_get "$NA_CONF_DIR/protect.conf" SSH_PORT)"
     msg ""
-    msg "  Whitelist: ${wl:-(пусто)}"
+    if [[ -z "$wl" && -n "$NA_WHITELIST_DEFAULT" ]]; then
+      msg "  Whitelist: (пусто)  $(c_yel "[дефолт при apply: $NA_WHITELIST_DEFAULT]")"
+    else
+      msg "  Whitelist: ${wl:-(пусто)}"
+    fi
     msg "  TCP: ${tcp:-?}    UDP: ${udp:-—}    SSH: ${ssh:-авто}"
     msg "  ─────────────────────────────────────"
     msg "  1. Показать кандидатов (na-fw-top-talkers)"
