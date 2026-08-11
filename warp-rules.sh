@@ -978,6 +978,13 @@ NA_SCANLIST_REF="${NA_SCANLIST_REF:-aa4c79a665007bc6df00f53c0622cd9fa8aaef81}"
 # именно этот дефолт показывается в шапке и уходит в первый прогон protect.
 TCP_PORTS="${TCP_PORTS:-80,443}"
 
+# Известный набор доверенных IP владельца (скрипт непубличный, см. коммент к
+# AUTO_REMOVE_LEGACY_FIREWALL) — предлагается в na_ensure_whitelist, когда
+# established-автодетект панели ничего не нашёл (панель молчит в момент apply).
+# 93.100.162.144 — домашний ПК; 213.165.58.154 — панель Remnawave;
+# 213.176.77.11 — бот (в т.ч. SSH); 45.131.41.76 — нода МОСТ.
+NA_WHITELIST_DEFAULT="${NA_WHITELIST_DEFAULT:-93.100.162.144,213.165.58.154,213.176.77.11,45.131.41.76}"
+
 # Сносить legacy ufw/iptables автоматически сразу после того, как confirm
 # реально снял ВЗВЕДЁННЫЙ сейфти-таймер (не при холостом нажатии). Дефолт 1 —
 # осознанное решение владельца (скрипт непубличный, использует только он).
@@ -1266,6 +1273,11 @@ na_ensure_whitelist(){
     if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#cands[@]} )); then
       ans="${cands[$((pick-1))]}"
     fi
+  elif [[ -n "$NA_WHITELIST_DEFAULT" ]]; then
+    msg "$(c_cyn '[*] Established-соединений на node-порт сейчас нет, но есть известный дефолт (домашний ПК, панель, бот, нода МОСТ).')"
+    printf '%s' "$(c_yel "[?] Использовать $NA_WHITELIST_DEFAULT как WHITELIST? (Y/n): ")" >&2
+    local yn; read -r yn < /dev/tty 2>/dev/null
+    [[ -z "$yn" || "$yn" =~ ^[yYдД]$ ]] && ans="$NA_WHITELIST_DEFAULT"
   fi
 
   if [[ -z "$ans" ]]; then
