@@ -1192,9 +1192,20 @@ na_ensure_minisign(){
   [[ "$NA_REQUIRE_SIG" == 1 ]] || return 0
   command -v minisign >/dev/null 2>&1 && return 0
   msg "$(c_yel '[*] Устанавливаю minisign (для проверки подписей node-accelerator)...')"
-  apt-get update -qq 2>/dev/null || true
-  apt-get install -y -qq minisign >/dev/null 2>&1 && return 0
+  local aptlog; aptlog="$(mktemp)"
+  apt-get update -qq >"$aptlog" 2>&1 || true
+  if apt-get install -y -qq minisign >>"$aptlog" 2>&1; then
+    rm -f "$aptlog"
+    return 0
+  fi
   msg "$(c_red '[!] Не удалось поставить minisign — проверка подписи невозможна.')"
+  msg "$(c_yel '    Вывод apt (последние строки):')"
+  tail -n 6 "$aptlog" | while IFS= read -r l; do msg "$(c_yel "      $l")"; done
+  rm -f "$aptlog"
+  if ! apt-cache policy minisign 2>/dev/null | grep -q 'Candidate:.*[0-9]'; then
+    msg "$(c_yel '    Пакет minisign не найден ни в одном подключённом репозитории')"
+    msg "$(c_yel '    (возможно, не подключён universe/multiverse — проверь /etc/apt/sources.list).')"
+  fi
   msg "$(c_yel '    Поставь пакет вручную либо временно ослабь: NA_REQUIRE_SIG=0.')"
   return 1
 }
