@@ -1901,18 +1901,23 @@ na_menu_rollback(){
   esac
 }
 
-na_menu_apply(){
+na_menu_advanced(){
   msg ""
-  msg "  1. Полностью (оптимизация + защита)"
-  msg "  2. Только оптимизация (ядро, sysctl, память, NIC)"
-  msg "  3. Только защита (nftables + CrowdSec + блоклисты)"
+  msg "$(c_cyn '──── Дополнительно ────')"
+  msg "  1. Только оптимизация (ядро, sysctl, память, NIC)"
+  msg "  2. Только защита (nftables + CrowdSec + блоклисты)"
+  msg "  3. Тонкие параметры"
+  msg "  4. Обслуживание"
+  msg "  5. Откат"
   msg "  0. Назад"
-  printf '%s' "$(c_yel '[?] Выбор (0-3): ')" >&2
+  printf '%s' "$(c_yel '[?] Выбор (0-5): ')" >&2
   local c; read -r c < /dev/tty 2>/dev/null || return 1
   case "$c" in
-    1) na_apply all ;;
-    2) na_apply optimize ;;
-    3) na_apply protect ;;
+    1) na_apply optimize ;;
+    2) na_apply protect ;;
+    3) na_menu_params ;;
+    4) na_menu_maintenance ;;
+    5) na_menu_rollback ;;
     0) return 0 ;;
     *) msg "$(c_red 'Неверный выбор, повтори.')" ;;
   esac
@@ -1924,7 +1929,7 @@ na_menu_apply(){
 mode_na_hardening(){
   na_require_root || return 1
   while :; do
-    local kern qdisc swapsz fw crowd bouncer wl tcp udp ssh
+    local kern qdisc swapsz fw crowd bouncer wl tcp udp ssh safety=false
     msg ""
     msg "$(c_cyn '──── Оптимизация и защита ноды ────')"
     kern="$(uname -r)"; qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null)"
@@ -1947,33 +1952,52 @@ mode_na_hardening(){
     ssh="$(na_get "$NA_CONF_DIR/protect.conf" SSH_PORT)"
     msg "  Порты: TCP ${tcp:-?} · UDP ${udp:-авто} · SSH ${ssh:-авто}"
     if na_safety_armed; then
+      safety=true
       local secs; secs="$(na_safety_remaining_s 2>/dev/null)"
       msg "  $(c_red "Авто-откат: ВЗВЕДЁН${secs:+, осталось ${secs}с}")"
     else
       msg "  Авто-откат: не взведён"
     fi
     msg "$(c_cyn '─────────────────────────────────────────────')"
-    msg "  1. Применить"
-    msg "  2. Подтвердить доступ (confirm)"
-    msg "  3. Белый список и порты"
-    msg "  4. Параметры"
-    msg "  5. Статус и диагностика"
-    msg "  6. Обслуживание"
-    msg "  7. Откат"
+    if $safety; then
+      msg "  1. SSH и HTTPS работают — сохранить правила"
+      msg "  2. Настроить или обновить защиту"
+      msg "  3. Доступ, whitelist и порты"
+      msg "  4. Проверить состояние"
+      msg "  5. Дополнительно"
+    else
+      msg "  1. Настроить или обновить защиту"
+      msg "  2. Доступ, whitelist и порты"
+      msg "  3. Проверить состояние"
+      msg "  4. Дополнительно"
+    fi
     msg "  0. Назад"
-    printf '%s' "$(c_yel '[?] Выбор (0-7): ')" >&2
+    if $safety; then
+      printf '%s' "$(c_yel '[?] Выбор (0-5): ')" >&2
+    else
+      printf '%s' "$(c_yel '[?] Выбор (0-4): ')" >&2
+    fi
     local c; read -r c < /dev/tty 2>/dev/null || return 1
-    case "$c" in
-      1) na_menu_apply ;;
-      2) na_confirm ;;
-      3) na_menu_whitelist ;;
-      4) na_menu_params ;;
-      5) na_menu_status ;;
-      6) na_menu_maintenance ;;
-      7) na_menu_rollback ;;
-      0) return 0 ;;
-      *) msg "$(c_red 'Неверный выбор, повтори.')" ;;
-    esac
+    if $safety; then
+      case "$c" in
+        1) na_confirm ;;
+        2) na_apply all ;;
+        3) na_menu_whitelist ;;
+        4) na_menu_status ;;
+        5) na_menu_advanced ;;
+        0) return 0 ;;
+        *) msg "$(c_red 'Неверный выбор, повтори.')" ;;
+      esac
+    else
+      case "$c" in
+        1) na_apply all ;;
+        2) na_menu_whitelist ;;
+        3) na_menu_status ;;
+        4) na_menu_advanced ;;
+        0) return 0 ;;
+        *) msg "$(c_red 'Неверный выбор, повтори.')" ;;
+      esac
+    fi
   done
 }
 
